@@ -20,10 +20,10 @@ CROW_ARCHITECTURE = ARCHITECTURE_DIR / "crow_300m_final.yaml"
 
 def tiny_config(**overrides: Any) -> RecurrentConfig:
     """
-    `config/model_architecture/tiny.yaml` with overrides applied (the test-suite model).
+    `config/model_architecture/tiny.yaml` with native CPU execution by default; kernel tests opt in explicitly.
     """
 
-    return RecurrentConfig.from_yaml(TINY_ARCHITECTURE, **overrides)
+    return RecurrentConfig.from_yaml(TINY_ARCHITECTURE, **({"use_custom_kernels": False} | overrides))
 
 
 tiny = tiny_config
@@ -154,7 +154,6 @@ def test_architecture_yamls_list_every_tunable_field() -> None:
     fixed = {
         "attn_impl",
         "init_strategy",
-        "init_orthogonal",
         "activation_checkpoint_impl",
         "injection_type",
         "state_init",
@@ -247,7 +246,6 @@ def test_to_dict_contains_only_dataclass_fields() -> None:
     [
         ("attn_impl", "flash"),
         ("init_strategy", "normal"),
-        ("init_orthogonal", False),
         ("activation_checkpoint_impl", "per-block"),
         ("injection_type", "add"),
         ("state_init", "zero"),
@@ -257,6 +255,36 @@ def test_to_dict_contains_only_dataclass_fields() -> None:
 def test_invalid_single_value_fields_rejected(field: str, value: object) -> None:
     with pytest.raises(ValueError, match=f"{field}="):
         tiny(**{field: value})
+
+
+@pytest.mark.parametrize('orthogonal', [True, False])
+def test_initialization_selection_survives_json(tmp_path: Path, orthogonal: bool) -> None:
+    cfg = tiny(init_orthogonal=orthogonal)  # architecture YAML override
+    assert cfg.init.orthogonal is orthogonal
+    path = tmp_path/'model_config.json'
+    cfg.to_json(path)
+    restored = RecurrentConfig.from_json(path)
+    assert restored.init_orthogonal is orthogonal and restored.init.orthogonal is orthogonal
+    assert restored.init.table == cfg.init.table
+
+
+@pytest.mark.parametrize('mode', ['none', 'inverse_sqrt_depth'])
+def test_residual_scaling_uses_expected_transformer_depth(tmp_path: Path, mode: str) -> None:
+    cfg = tiny(residual_scaling=mode, n_layers_in_prelude=3, n_layers_in_coda=3,
+               n_layers_in_recurrent_block=[5, 5, 5], mean_recurrence=[8, 8, 8], mean_backprop_depth=[6, 6, 6])
+    assert cfg.effective_expected_depth == 126
+    assert cfg.residual_scale == (126**-.5 if mode == 'inverse_sqrt_depth' else 1.0)
+    cfg.to_json(tmp_path/'model.json')
+    restored = RecurrentConfig.from_json(tmp_path/'model.json')
+    assert restored.residual_scale == cfg.residual_scale
+    assert 'residual_scale' not in cfg.to_dict()  # derived, never mistaken for another persisted knob
+    assert tiny().residual_scaling == 'none' and tiny().residual_scale == 1.0
+
+
+@pytest.mark.parametrize('value', [None, True, False, 1, .1, '', 'sqrt_depth', [], {}])
+def test_residual_scaling_rejects_invalid_values(value: object) -> None:
+    with pytest.raises(ValueError, match='residual_scaling'):
+        tiny(residual_scaling=value)
 
 
 @pytest.mark.parametrize(
@@ -336,3 +364,49 @@ def test_bf16_residual_stream_rejects_other_values() -> None:
 def test_bf16_residual_stream_default_is_off_in_every_architecture_yaml() -> None:
     for path in (TINY_ARCHITECTURE, CROW_ARCHITECTURE):
         assert RecurrentConfig.from_yaml(path).bf16_residual_stream == "none", path
+
+
+@pytest.mark.parametrize("field", ["tie_embeddings", "qk_bias", "use_custom_kernels", "init_orthogonal"])
+@pytest.mark.parametrize("invalid", ["false", "true", 0, 1, None])
+@pytest.mark.parametrize("source", ["direct", "yaml", "json", "override"])
+def test_architecture_switches_require_booleans(tmp_path: Path, field: str, invalid: Any, source: str) -> None:
+    values = {field: invalid}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(values))
+    with pytest.raises(ValueError, match=field + " must be a boolean"):
+        if source == "direct":
+            RecurrentConfig(**values)
+        elif source == "yaml":
+            RecurrentConfig.from_yaml(path)
+        elif source == "json":
+            RecurrentConfig.from_json(path)
+        else:
+            RecurrentConfig.from_yaml(TINY_ARCHITECTURE, **values)
+
+
+@pytest.mark.parametrize("field", ["norm_eps", "rope_base"])
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), -float("inf"), True, "1e-6", None, [], 1j])
+@pytest.mark.parametrize("source", ["direct", "yaml", "json", "override"])
+def test_scales_require_positive_finite_reals(tmp_path: Path, field: str, invalid: Any, source: str) -> None:
+    if source in ("yaml", "json") and isinstance(invalid, complex):
+        pytest.skip("complex values have no standard JSON representation")
+    values: dict[str, Any] = {field: invalid} if field == "norm_eps" else {"rope_settings": {field: invalid}}
+    path = tmp_path / "config.json"
+    if source in ("yaml", "json"):
+        path.write_text(json.dumps(values))
+    with pytest.raises(ValueError, match=field + " must be > 0 and a finite real scalar"):
+        if source == "direct":
+            RecurrentConfig(**values)
+        elif source == "yaml":
+            RecurrentConfig.from_yaml(path)
+        elif source == "json":
+            RecurrentConfig.from_json(path)
+        else:
+            RecurrentConfig.from_yaml(TINY_ARCHITECTURE, **values)
+
+
+def test_valid_scalars_and_false_switches_are_preserved() -> None:
+    config = tiny(norm_eps=1, rope_settings={"rope_base": 12.5}, tie_embeddings=False, qk_bias=False)
+    assert config.norm_eps == 1 and isinstance(config.norm_eps, int)
+    assert config.rope_settings.rope_base == 12.5
+    assert config.tie_embeddings is False and config.qk_bias is False

@@ -1,0 +1,26 @@
+# Core sizes
+model_max_sequence_length: 4096   # the longest sequence the model accepts (the RoPE table covers this many positions); >= the run config's training_max_sequence_length
+n_embd: 2048                   # hidden size of the residual stream
+intermediate_size: 7168        # hidden size of the GatedMLP (null: 4 * n_embd)
+num_attention_heads: 32        # attention heads; n_embd must be divisible by it (head size = n_embd / heads = 64)
+
+# Vocabulary
+vocab_size: 32002              # size of the tokenizer vocabulary
+padding_multiple: 2048         # the embedding table is padded to a multiple of this
+padded_vocab_size: null        # null: vocab_size rounded up to padding_multiple (32768); an explicit value must be >= vocab_size (a smaller one is rejected)
+tie_embeddings: true           # lm_head shares the token-embedding weights
+
+# Block details
+rope_settings:
+  rope_base: 50000             # base of the rotary position embedding frequencies
+norm_eps: 1.0e-6               # epsilon of every RMSNorm / LayerNorm (write floats with a dot: YAML reads 1e-6 as a string)
+qk_bias: true                  # learned additive bias on the queries and keys of every attention layer
+bf16_residual_stream: none     # residual stream under bf16 autocast: none = fp32 (the RMSNorm outputs promote to fp32), core = bf16 inside the core blocks, all = bf16 everywhere; fp32 without autocast
+residual_scaling: inverse_sqrt_depth
+
+# Recurrent structure
+n_layers_in_prelude: 3         # SandwichBlocks before the recurrent core (run once, embed the input)
+n_layers_in_coda: 3            # SandwichBlocks after the recurrent core (run once, before the output norm and lm_head)
+n_layers_in_recurrent_block: [15]   # SandwichBlocks per recurrent core block; one entry per core block (here 3 blocks)
+mean_recurrence: [8]  # mean number of iterations per block (training sampler mean and eval depth); one entry per core block
+mean_backprop_depth: [6] # cap on the iterations with gradients per block (truncated backprop: the last min(sampled depth, this) iterations, so the average is lower); one entry per core block

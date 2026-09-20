@@ -11,7 +11,13 @@ Built on rich as the sibling of data_preparation/lib/ui/dashboard.py: both subcl
 a header (run, model / dataset config, device / precision, status), one bar per stage plus an overall bar with an
 ETA, the latest step's metrics, the latest validation losses per depth, the last events, the last logging
 records and a footer naming the log file. Every row is one line, the panels shrink on a short terminal, every
-mutation and render holds one lock, and the display redraws on its own timer: update_step is O(1).
+mutation and render holds one lock. The display checks for changes every 500 ms and redraws only when the
+displayed state changes, with a time-only heartbeat after 10 s; update_step is O(1). Startup and final cleanup
+are immediate. Elapsed time alone does not trigger the faster redraws.
+
+Training frames overwrite and space-pad the previous rows; only terminal resize clears the screen. Each live
+refresh uses synchronized-output mode (DEC 2026), so supporting terminals hide partial updates. Terminals that
+ignore that mode still get the overwriting renderer. Normal shutdown retains the transient-display cleanup.
 
 While the display is up nothing may print around it, so __enter__ (:class:`~training.ui.capture.TerminalCapture`)
 routes every logging record into the panel (third-party stream handlers detached for the duration), turns every
@@ -34,8 +40,11 @@ Usage (RunLogger opens it through training.logger.open_dashboard)::
         board.update_validation(step, {"val_loss_4": 3.2, "val_loss": 3.1})
         board.set_status("saving checkpoint")
 
+DASHBOARD_SHOW_MICRO_BATCHES=1 adds a bar of the running optimizer step's micro-batches (rank 0's share, reset at
+every step; `board.update_micro_batch(completed, total)`), for large models whose steps take long enough to watch.
+
 open_dashboard builds the live dashboard when enabled (TRAINING_DASHBOARD not 0 and stdout a terminal),
-else the :class:`~training.ui.fallback.ConsoleFallbackDashboard` with the same four methods: one log line per
+else the :class:`~training.ui.fallback.ConsoleFallbackDashboard` with the same methods: one log line per
 log_step_interval steps, per validation and per event, the same log file, no capture. Their own lines go through
 training.ui.common.lines_log to the log file (and, for the fallback, the console).
 

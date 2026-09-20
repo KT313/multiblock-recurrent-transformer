@@ -10,6 +10,7 @@ import gzip
 import io
 import json
 import os
+import signal
 import tempfile
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, replace
@@ -23,14 +24,14 @@ import pytest
 import yaml
 import zstandard
 
-from data_preparation.dataset_config import (
+from data_preparation.lib.dataset_config import (
     DatasetConfig,
     ProcessingConfig,
     SourceConfig,
     StageConfig,
     TokenizerConfig,
 )
-from data_preparation.layout import DatasetLayout
+from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.sources import hub_files
 from data_preparation.lib.sources.hub_files import file_format
 from data_preparation.lib.stages.download import prepare_tokenizer
@@ -43,6 +44,15 @@ os.environ.setdefault("HF_DATASETS_CACHE", _CACHE)
 
 Row = dict[str, Any]
 CfgFactory = Callable[..., DatasetConfig]
+
+
+@pytest.fixture(autouse=True)
+def restore_cli_signal_handler() -> Iterator[None]:
+    """Keep in-process CLI calls from leaking their SIGTERM handler into later tests."""
+
+    previous = signal.getsignal(signal.SIGTERM)
+    yield
+    signal.signal(signal.SIGTERM, previous)
 
 
 # --- a fake Hub for the hf_files / github_code loaders -----------------------------------------------------------------
@@ -119,17 +129,17 @@ class FakeHub:
         return self.sha
 
     def paths_info(self, repo_id: str, paths: list[str], revision: str | None, token: str | None) -> dict[str, int]:
-        assert (repo_id, revision) == (REPO, REV)
+        assert (repo_id, revision) == (REPO, self.sha)
         self.size_lookups += 1
         return {p: self.files[p].stat().st_size for p in paths}
 
     def hub_download(self, repo_id: str, filename: str, revision: str | None, token: str | None) -> Path:
-        assert (repo_id, revision) == (REPO, REV)
+        assert (repo_id, revision) == (REPO, self.sha)
         self.downloads.append(filename)
         return self.files[filename]
 
     def open_remote(self, repo_id: str, filename: str, revision: str | None, token: str | None, block_size: int) -> BinaryIO:
-        assert (repo_id, revision) == (REPO, REV)
+        assert (repo_id, revision) == (REPO, self.sha)
         self.streams.append(filename)
         handle = RecordingFile(self.files[filename])
         self.handles[filename] = handle
@@ -194,6 +204,7 @@ def cfg_factory() -> CfgFactory:
         tokens_per_row: int = 1,
         tokens: int = 10_000,
         tokenizer: TokenizerConfig | None = None,
+        bloom_deduplicate_across_sources: bool = False,
     ) -> DatasetConfig:
         sources = {name: replace(source, describe_tokens_per_row=tokens_per_row) for name, source in sources.items()}
         trained = {kind: [n for n, s in sources.items() if s.kind == kind and s.rows is None] for kind in ("pretrain", "instruct")}
@@ -227,6 +238,8 @@ def cfg_factory() -> CfgFactory:
             dataset_max_sequence_length=dataset_max_sequence_length,
             token_count=token_count,  # type: ignore[arg-type]  # Literal narrowed by the caller
             processing=processing,
+            bloom_deduplicate_across_sources=bloom_deduplicate_across_sources,
+            bloom_dedup_memory_mb=TEST_BLOOM_MEMORY_MB,
         )
 
     return make

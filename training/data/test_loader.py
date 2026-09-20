@@ -221,6 +221,29 @@ def test_loader_deterministic_under_seed(tokenizer: Tokenizer, entries: list[Dat
     assert not _same(a, c)
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("source_count", [1, 2])
+def test_validation_loader_restarts_the_same_prefix_after_partial_iteration(
+    tokenizer: Tokenizer, entries: list[DataEntry], rank: int, source_count: int
+) -> None:
+    """Repeated validation uses the same tokens/targets/sources even as iterator/global RNG advances."""
+    generator = torch.Generator().manual_seed(233 + rank)
+    loader = build_dataloader(
+        entries[:source_count], tokenizer, training_max_sequence_length=MIXTURE_SEQUENCE_LENGTH,
+        batch_size=2, num_workers=0, seed=233 + rank, shard=(rank, 2), generator=generator,
+    )
+    first = _batches(cast(Iterable[Batch], loader), 3)
+    assert len(first) == 3
+    after_first = generator.get_state().clone()
+    # Emulate intervening training draws and other iterators sharing the private base-seed generator.
+    with torch.random.fork_rng(devices=[]):
+        torch.rand(37)
+        torch.rand(19, generator=generator)
+        repeated = _batches(cast(Iterable[Batch], loader), 3)
+    assert not torch.equal(after_first, generator.get_state())
+    assert _same(first, repeated)
+
+
 def test_workers_zero_and_two_identical_with_micro_batch_one(
     tokenizer: Tokenizer, entries: list[DataEntry], tiny_pretrain_dir: Path
 ) -> None:

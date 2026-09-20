@@ -1,0 +1,13 @@
+[package]
+name = "preparer-native-experiment"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "preparer_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "=0.27.2", features = ["extension-module"] }
+tokenizers = { version = "=0.23.1", default-features = false, features = ["onig"] }

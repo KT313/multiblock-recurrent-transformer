@@ -10,7 +10,15 @@ import logging
 
 import pytest
 
-from training.ui.common import DASHBOARD_LOGGER_NAME, ENV_VAR, TRAINING_LOGGER_NAME, dashboard_enabled, log
+from training.ui.common import (
+    DASHBOARD_LOGGER_NAME,
+    ENV_VAR,
+    MICRO_BATCHES_ENV,
+    TRAINING_LOGGER_NAME,
+    dashboard_enabled,
+    log,
+    micro_batches_shown,
+)
 
 
 def test_enabled_follows_env_and_tty(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -28,6 +36,17 @@ def test_enabled_follows_env_and_tty(monkeypatch: pytest.MonkeyPatch) -> None:
     assert dashboard_enabled(Tty()) is True
     monkeypatch.setenv(ENV_VAR, "off")
     assert dashboard_enabled(Tty()) is False
+
+
+def test_micro_batches_shown_is_off_unless_the_env_var_enables_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(MICRO_BATCHES_ENV, raising=False)
+    assert micro_batches_shown() is False
+    for value in ("1", "true", " YES ", "on"):
+        monkeypatch.setenv(MICRO_BATCHES_ENV, value)
+        assert micro_batches_shown() is True, value
+    for value in ("0", "false", "off", "", "2"):
+        monkeypatch.setenv(MICRO_BATCHES_ENV, value)
+        assert micro_batches_shown() is False, value
 
 
 def test_the_dashboard_logger_sits_under_the_training_hierarchy() -> None:

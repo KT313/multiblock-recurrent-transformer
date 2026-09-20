@@ -15,14 +15,16 @@ Two write modes:
   failure or a stop request (checked between raw shards) loses at most one raw shard of work and the next call
   resumes behind the last covered one. The dedup filter (:class:`SeenDocuments`, a Bloom filter under
   dedup.bloom_memory_mb) is refilled from the hash column of the processed shards at the start of every
-  build, so the rows kept are exactly those of one full pass.
-* all at once (config.shuffle_of(name), the default for instruct sources, and dedup.mode: minhash): every
-  raw shard is read, the survivors are shuffled with random.Random(source.seed) (or, for minhash, run through
-  the LSH index), written into processed/<name>.tmp and swapped into place rename-aside
+  build, so the rows kept are exactly those of one full pass. With pass_workers > 1 (and no decontamination) the
+  raw shards are read, filtered, hashed and staged in that many worker processes (`build_workers.py`); final file
+  publication, dedup, statistics and the manifest stay in the build thread, with the same rows and shard boundaries.
+* whole-source publication (config.shuffle_of(name), the default for instruct sources, and dedup.mode: minhash):
+  every raw shard is streamed through the filters. Shuffling uses a bounded-cache SQLite index on disk;
+  MinHash still retains rows and its LSH index in memory. Results are written into a private owned build slot
+  and swapped into place rename-aside
   (:func:`_swap_into_place`; the repair step finishes an interrupted swap). Why shuffle: the training loader reads
   a source's shards in order and only mixes between sources; instruct repositories are sorted by task, so without
-  a shuffle the model would see one task for thousands of steps. Instruct sources are small, so rebuilding them
-  whole is cheap; a top-up rebuilds the folder from every raw shard.
+  a shuffle the model would see one task for thousands of steps. A top-up rebuilds the folder from every raw shard.
 
 A build is a no-op when the processed manifest is current and covers every raw shard. It starts from a fresh
 manifest, deleting the whole processed folder first, when the manifest is stale, when the covered shards are no
@@ -32,29 +34,34 @@ with zero shards still gets a (zero-shard) processed manifest, so the source cou
 
 from __future__ import annotations
 
+from data_preparation.lib.conversation_format import CHAT_COLUMNS, fit_conversation, hash_conversation
+
 import multiprocessing
 import random
-import shutil
 from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import AbstractContextManager, nullcontext
 from concurrent.futures.process import BrokenProcessPool
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import pyarrow as pa
 import pyarrow.parquet as pq
 
-from data_preparation.dataset_config import DatasetConfig, DecontaminationConfig, SourceConfig
-from data_preparation.layout import DatasetLayout, processed_columns
+from data_preparation.lib.storage.ownership import BuildWorkspace, guarded_path
+from data_preparation.lib.dataset_config import DatasetConfig, DecontaminationConfig, DedupConfig, SourceConfig
+from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.abort import StopCheck, check_stop
-from data_preparation.lib.build.assessment import ProcessedAssessment, assess_processed_folder
 from data_preparation.lib.iteration import chunks
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.progress import Progress
+from data_preparation.lib.download_debug import WorkerDebugOptions, initialize_worker_debug, measured_worker, worker_debug_options
+from data_preparation.lib.download_profile import measure
 from data_preparation.lib.stages.benchmarks import load_benchmark_ngrams
-from data_preparation.lib.stages.exact_dedup import SeenDocuments, stored_hashes, text_hash64
+from data_preparation.lib.stages.exact_dedup import SeenDocuments, text_hash64
 from data_preparation.lib.stages.fuzzy_dedup import fuzzy_dedup
+from data_preparation.lib.stages.shuffle import shuffled_rows
+from data_preparation.lib.stages.build_output import ProcessedOutput as ProcessedOutput, prepare_source_output  # noqa: PLC0414 - compatibility export
+from data_preparation.lib.stages.build_workers import ShardSource, ShardWorkers
 from data_preparation.lib.stages.row_pipeline import (
     check_contamination,
     check_quality,
@@ -67,11 +74,9 @@ from data_preparation.lib.stages.download import (
     DEFAULT_SHARD_SIZE,
     TokenCounter,
     inspect_raw,
-    new_manifest,
 )
 from data_preparation.lib.stages.truncation import NUMBER_OF_SPECIAL_TOKENS
 from data_preparation.lib.storage.manifest import shard_list, Manifest, ShardInfo
-from data_preparation.lib.storage.parquet import publish_shard, shard_name
 from data_preparation.lib.ui.dashboard import progress
 
 log = get_logger(__name__)
@@ -95,13 +100,16 @@ def build_source(
 ) -> Manifest:
     """
     Turn the raw shards of source name into processed/<name> (see the module docstring) and return the
-    processed manifest. pass_workers sizes the spawn process pool of the optional cleaning passes
-    (decontamination / minhash; 1 = in-process). rows_target caps a per-raw-shard build: it stops after the raw
+    processed manifest. pass_workers sizes the spawn process pool of a per-raw-shard build's shard workers
+    (:class:`ShardWorkers`) or of the optional cleaning passes (decontamination / minhash); 1 = in-process. rows_target caps a per-raw-shard build: it stops after the raw
     shard that brings the processed rows to that many (the planner's rows_sufficient; raw rows past the budget
     stay unbuilt until a larger target asks for them); an all-at-once build ignores it. Raises FileNotFoundError
     without a current raw manifest (run the download first).
     """
 
+    # validate the source and require current raw input
+    config.validate_identifiers()
+    guarded_path(layout.root, layout.processed_dir(name))
     source = config.sources[name]
     processing = config.source_processing(name)
     source_hash = config.processed_hash(name)
@@ -110,56 +118,56 @@ def build_source(
     if raw is None:
         raise FileNotFoundError(f"{name}: no current raw manifest in {raw_dir}; run the download stage first")
     all_at_once = config.shuffle_of(name) or (source.kind == "pretrain" and processing.dedup.mode == "minhash")
-    assessment = assess_processed_folder(config, name, processed_dir, shard_list(raw.shards), check_files=False)
-    if assessment.problem == "unreadable_manifest":
-        # never deleted here, on either path: the repair step does that, after the user confirmed
-        raise RuntimeError(
-            f"{name}: {processed_dir / 'MANIFEST.json'} cannot be parsed; the repair step deletes the folder after "
-            "confirmation (`prepare` asks, `--yes` answers), or fix or delete it by hand"
-        )
+    prepared = prepare_source_output(config, name, source_hash, raw, processed_dir, all_at_once=all_at_once)
+    if isinstance(prepared, Manifest):
+        return prepared
+    output, pending = prepared
 
-    if all_at_once:
-        if assessment.problem == "none" and assessment.manifest is not None:
-            return assessment.manifest  # built from exactly the current raw shards
-        # the rows on disk, not the estimate the config was checked against: refuse before the filter and the pool
-        config.check_all_at_once_rows(name, raw.rows(), at_build=True)
-        output = ProcessedOutput(_fresh_manifest(config, name, source_hash), _temporary_dir(processed_dir), is_new=True)
-        pending = list(raw.shards)
-    else:
-        output = ProcessedOutput.resume(config, name, source_hash, processed_dir, assessment)
-        pending = raw.shards[output.covered() :]
-        if not pending:
-            if output.is_new:
-                output.save([])  # an exhausted raw folder with zero shards still gets its processed manifest
-            return output.manifest
-
+    # restore the dedup filter and prepare row processing
     stats = output.manifest.stats
-    seen = SeenDocuments(memory_mb=processing.dedup.bloom_memory_mb) if processing.dedup.mode != "none" else None
+    seen = restore_dedup_filter(name, raw, output, processing.dedup)
+    log.info("%s: building %d raw shard(s) (%d already covered) -> %s", name, len(pending), output.covered(), processed_dir)
+
+    # process shards without changing the publication and stop boundaries
+    if not all_at_once and rows_target is not None and output.manifest.rows() >= rows_target:
+        log.info("%s: %d processed rows serve the budget of %d; %d raw shard(s) left unbuilt",
+                 name, output.manifest.rows(), rows_target, len(pending))
+    else:
+        pipeline = RowPipeline(config, name, layout, pass_workers, shard_size, stats, seen=seen, should_stop=should_stop if all_at_once else None)
+        pending_rows = sum(shard.rows for shard in pending)
+        with (
+            pipeline,
+            progress(total=pending_rows, desc=name, unit="row", panel="builds") as bar,
+            _shard_workers(pipeline, all_at_once=all_at_once) as workers,
+        ):
+            pipeline.bar = bar
+            if all_at_once:
+                _build_all_at_once(pipeline, raw_dir, raw, output, processed_dir, shard_size, should_stop)
+            else:
+                _build_per_raw_shard(pipeline, raw_dir, raw, pending, output, shard_size, should_stop, rows_target, workers)
+
+    # record the measured filter load and complete the generation
+    if seen is not None:
+        _record_filter_load(stats["dedup"], seen)
+        output.save(output.manifest.input_shards)  # the same shards, the manifest re-saved with the filter's load
+    if not output.manifest.generation_complete:
+        output.manifest.complete_generation(output.directory)
+    log.info("%s: %d processed rows, %s tokens", name, output.manifest.rows(), output.manifest.tokens())
+    return output.manifest
+
+
+def restore_dedup_filter(name: str, raw: Manifest, output: ProcessedOutput, dedup: DedupConfig) -> SeenDocuments | None:
+    """Refill from committed hashes and record capacity using the raw row upper bound."""
+    stats = output.manifest.stats
+    seen = SeenDocuments(memory_mb=dedup.bloom_memory_mb) if dedup.mode != "none" else None
     if seen is not None:
         if not output.is_new:
             seen.add_all(output.stored_hashes())
-        # the raw row count is the honest upper bound of what this build can insert
         log.info("%s: %s", name, seen.describe(raw.rows()))
         seen.check(raw.rows())
         stats["dedup"]["rows_on_disk"] = raw.rows()
         stats["dedup"]["expected_false_positive_rate"] = seen.expected_false_positive_rate(raw.rows())
-    log.info("%s: building %d raw shard(s) (%d already covered) -> %s", name, len(pending), output.covered(), processed_dir)
-
-    # per-shard builds check the stop request after every published shard; an all-at-once build reads every raw
-    # shard before it writes anything, so its readers check between raw shards instead
-    pipeline = RowPipeline(config, name, layout, pass_workers, shard_size, stats, seen=seen, should_stop=should_stop if all_at_once else None)
-    pending_rows = sum(shard.rows for shard in pending)
-    with pipeline, progress(total=pending_rows, desc=name, unit="row", panel="builds") as bar:
-        pipeline.bar = bar
-        if all_at_once:
-            _build_all_at_once(pipeline, raw_dir, raw, output, processed_dir, shard_size, should_stop)
-        else:
-            _build_per_raw_shard(pipeline, raw_dir, raw, pending, output, shard_size, should_stop, rows_target)
-    if seen is not None:
-        _record_filter_load(stats["dedup"], seen)
-        output.save(output.manifest.input_shards)  # the same shards, the manifest re-saved with the filter's load
-    log.info("%s: %d processed rows, %s tokens", name, output.manifest.rows(), output.manifest.tokens())
-    return output.manifest
+    return seen
 
 
 def _build_per_raw_shard(
@@ -171,14 +179,20 @@ def _build_per_raw_shard(
     shard_size: int,
     should_stop: StopCheck | None,
     rows_target: int | None = None,
+    workers: ShardWorkers | None = None,
 ) -> None:
     """
     One raw shard at a time: its survivors become the next processed shard(s), published and recorded (with the
     raw shard as covered) before the next raw shard starts; the stop request is checked in between. With
-    rows_target the loop ends once the processed rows reach it (checked before every raw shard).
+    rows_target the loop ends once the processed rows reach it (checked before every raw shard). With workers the
+    reading, filtering, hashing and writing happen in their processes (one raw shard per worker ahead of the loop),
+    the dedup and the bookkeeping here (:func:`_publish_prepared`).
     """
 
     first_row_index = sum(shard.rows for shard in raw.shards[: output.covered()])
+    if workers is not None:
+        for ahead in range(min(workers.processes, len(pending))):
+            workers.prepare(ahead, raw_dir / pending[ahead].name)
     for index, shard in enumerate(pending, start=1):
         if rows_target is not None and output.manifest.rows() >= rows_target:
             log.info(
@@ -186,14 +200,72 @@ def _build_per_raw_shard(
                 raw.source, output.manifest.rows(), rows_target, len(pending) - index + 1,
             )
             return
+        if output.manifest.generation_complete or output.manifest.generation_id is None:
+            output.manifest.begin_generation(output.directory)
         if pipeline.bar is not None:
             pipeline.bar.set_postfix({"shard": f"{index}/{len(pending)}"}, refresh=False)
         pipeline.stats["input_rows"] += shard.rows
-        survivors = list(pipeline.run(raw_dir, [shard], first_row_index=first_row_index))
-        output.publish(survivors, shard_size)
+        if workers is None:
+            survivors = list(pipeline.run(raw_dir, [shard], first_row_index=first_row_index))
+            output.publish(survivors, shard_size)
+        else:
+            _publish_prepared(pipeline, workers, index - 1, pending, raw_dir, output, shard_size, rows_target)
         output.save([*output.manifest.input_shards, [shard.name, shard.rows]])
         first_row_index += shard.rows
         check_stop(should_stop)
+
+
+def _publish_prepared(
+    pipeline: RowPipeline, workers: ShardWorkers, index: int, pending: list[ShardInfo], raw_dir: Path, output: ProcessedOutput, shard_size: int,
+    rows_target: int | None,
+) -> None:
+    """
+    Raw shard pending[index] through the workers: its hashes and filter counts (prepared earlier) into the
+    statistics and the bar, the dedup over the hashes, the kept rows written by the worker that holds them (which
+    takes raw shard index + processes next) and recorded in the manifest, in the order of `ProcessedOutput.publish`.
+    """
+
+    prepared = workers.prepared(index)
+    _add_counts(pipeline.stats["length_filter"], prepared.length_filter)
+    _add_counts(pipeline.stats["quality_filter"], prepared.quality_filter)
+    pipeline._advance(pending[index].rows)
+    keep = _new_hashes(prepared.hashes, pipeline.seen, pipeline.stats["dedup"])
+    following = index + workers.processes
+    needs_more = rows_target is None or output.manifest.rows() + len(keep) < rows_target
+    next_raw_path = raw_dir / pending[following].name if following < len(pending) and needs_more else None
+    written = workers.write(index, keep, output.directory, len(output.manifest.shards), shard_size, next_raw_path=next_raw_path)
+    for name, rows, tokens in written:
+        output.manifest.add_shard(name, rows, tokens)
+
+
+def _shard_workers(pipeline: RowPipeline, *, all_at_once: bool) -> AbstractContextManager[ShardWorkers | None]:
+    """
+    The shard workers of a per-raw-shard pretrain build with pass_workers > 1 and no decontamination (that pass
+    has its own pool, :class:`Decontaminator`); None (the in-thread path) otherwise.
+    """
+
+    processing = pipeline.processing
+    if pipeline.pass_workers <= 1 or all_at_once or pipeline.kind != "pretrain" or processing.decontamination.enabled:
+        return nullcontext(None)
+    log.info("%s: reading, filtering and writing the raw shards in %d worker processes", pipeline.name, pipeline.pass_workers)
+    source = ShardSource(
+        name=pipeline.name, text_field=pipeline.source.text_field, min_chars=processing.min_chars,
+        quality_filter=processing.quality_filter, normalize=processing.dedup.normalize,
+        max_tokens=pipeline.dataset_max_sequence_length, batch_size=pipeline.batch_size,
+    )
+    return ShardWorkers(pipeline.pass_workers, source)
+
+
+def _add_counts(totals: dict[str, Any], counts: dict[str, Any]) -> None:
+    """
+    counts summed into totals, nested dicts (rejection_reasons) included.
+    """
+
+    for key, value in counts.items():
+        if isinstance(value, dict):
+            _add_counts(totals.setdefault(key, {}), value)
+        else:
+            totals[key] = totals.get(key, 0) + value
 
 
 def _build_all_at_once(
@@ -206,8 +278,8 @@ def _build_all_at_once(
     should_stop: StopCheck | None,
 ) -> None:
     """
-    Every raw shard through the pipeline (plus fuzzy dedup in minhash mode), shuffled when the source asks for
-    it, written into output.directory (the .tmp sibling) and swapped over processed_dir rename-aside
+    Every raw shard through the pipeline (plus fuzzy dedup in minhash mode), shuffled on disk when requested,
+    written in bounded batches into output.directory (the owned temporary slot) and swapped over processed_dir
     (:func:`_swap_into_place`).
     """
 
@@ -215,17 +287,25 @@ def _build_all_at_once(
     rows = pipeline.run(raw_dir, list(raw.shards), first_row_index=0)
     if pipeline.kind == "pretrain" and pipeline.processing.dedup.mode == "minhash":
         rows = fuzzy_dedup(rows, pipeline.processing.dedup, pipeline.stats["dedup"], pipeline.pass_workers)
-    survivors = list(rows)
-    if output.manifest.shuffled:
-        random.Random(pipeline.source.seed).shuffle(survivors)
     check_stop(should_stop)
 
     temporary = output.directory
     if temporary.exists():
         log.warning("removing leftover %s of an interrupted build", temporary)
-        shutil.rmtree(temporary)
-    output.publish(survivors, shard_size)
+        BuildWorkspace(processed_dir).remove(temporary, "temporary")
+    BuildWorkspace(processed_dir).create_temporary()
+    if output.manifest.shuffled:
+        with shuffled_rows(rows, temporary, pipeline.source.seed, should_stop=should_stop) as shuffled:
+            for batch in chunks(shuffled, shard_size):
+                check_stop(should_stop)
+                output.publish(batch, shard_size)
+    else:
+        for batch in chunks(rows, shard_size):
+            check_stop(should_stop)
+            output.publish(batch, shard_size)
+    check_stop(should_stop)
     output.save(shard_list(raw.shards))
+    output.manifest.complete_generation(output.directory)
     _swap_into_place(temporary, processed_dir)
     output.directory = processed_dir
 
@@ -246,125 +326,24 @@ def _record_filter_load(dedup_stats: dict[str, Any], seen: SeenDocuments) -> Non
 def _swap_into_place(temporary: Path, processed_dir: Path) -> None:
     """
     Replace processed_dir by the complete temporary folder without a moment where neither exists: the
-    old folder steps aside (processed/<name>.old), the new one is renamed into place, and only then is anything
-    deleted. A crash between the renames leaves the .old next to the complete .tmp (the repair step
-    finishes the swap), one after them leaves the new folder in place next to a stale .old (the repair step
+    old folder steps aside (the owned backup slot), the new one is renamed into place, and only then is anything
+    deleted. A crash between the renames leaves the backup next to the complete temporary (the repair step
+    finishes the swap), one after them leaves the new folder in place next to a stale backup (the repair step
     removes it).
     """
 
-    old = _old_dir(processed_dir)
-    if old.exists():
-        shutil.rmtree(old)  # leftover of an earlier crashed swap; the folder that replaced it is in place or in `temporary`
-    if processed_dir.exists():
-        processed_dir.rename(old)
-    temporary.rename(processed_dir)
-    if old.exists():
-        shutil.rmtree(old)
+    BuildWorkspace(processed_dir).publish(temporary)
 
 
 def _temporary_dir(processed_dir: Path) -> Path:
-    """
-    processed/<name>.tmp: where an all-at-once build writes before the swap into place.
-    """
-
-    return processed_dir.with_name(processed_dir.name + ".tmp")
+    return BuildWorkspace(processed_dir).path("temporary")
 
 
 def _old_dir(processed_dir: Path) -> Path:
-    """
-    processed/<name>.old: where :func:`_swap_into_place` parks the folder it replaces until the new one is
-    in place.
-    """
-
-    return processed_dir.with_name(processed_dir.name + ".old")
+    return BuildWorkspace(processed_dir).path("backup")
 
 
 # --- the processed folder ------------------------------------------------------------------------------------------------
-
-
-@dataclass
-class ProcessedOutput:
-    """
-    The processed folder of one build: its manifest, the directory shards are published into (the final folder,
-    or the .tmp sibling of an all-at-once build) and whether the manifest was created by this call (a new
-    manifest is saved even when nothing is appended, so an empty source still counts as built).
-    """
-
-    manifest: Manifest
-    directory: Path
-    is_new: bool
-
-    @classmethod
-    def resume(cls, config: DatasetConfig, name: str, source_hash: str, processed_dir: Path, assessment: ProcessedAssessment) -> ProcessedOutput:
-        """
-        The stored manifest if new raw shards can be appended to it (the shared verdict says built or behind
-        raw: current hash, expected columns, covered shards a prefix of the raw shards); otherwise a fresh one, and
-        the folder is deleted first, so no shard of the previous build survives unlisted. A manifest that cannot be
-        parsed never gets here (:func:`build_source` refuses it before choosing a path).
-        """
-
-        if assessment.problem in ("none", "behind_raw") and assessment.manifest is not None:
-            return cls(assessment.manifest, processed_dir, is_new=False)
-        if assessment.problem != "absent":
-            log.warning("%s: processed %s, rebuilding everything", name, assessment.reason)
-        if processed_dir.exists():
-            log.info("%s: removing %s before the rebuild", name, processed_dir)
-            shutil.rmtree(processed_dir)
-        return cls(_fresh_manifest(config, name, source_hash), processed_dir, is_new=True)
-
-    def covered(self) -> int:
-        """
-        Raw shards the manifest already covers.
-        """
-
-        return len(self.manifest.input_shards)
-
-    def stored_hashes(self) -> Iterator[int]:
-        """
-        The exact-dedup keys of every processed row on disk, in manifest order (refills the dedup filter).
-        """
-
-        return stored_hashes(self.directory / shard.name for shard in self.manifest.shards)
-
-    def publish(self, rows: list[Row], shard_size: int) -> None:
-        """
-        Append rows as shard(s) of at most shard_size rows, each recorded in the manifest.
-        """
-
-        for start in range(0, len(rows), shard_size):
-            chunk = rows[start : start + shard_size]
-            path = publish_shard(pa.Table.from_pylist(chunk), self.directory / shard_name(len(self.manifest.shards)))
-            self.manifest.add_shard(path.name, len(chunk), sum(int(row["tokens"]) for row in chunk))
-
-    def save(self, covered: list[list[Any]]) -> None:
-        self.manifest.input_shards = list(covered)
-        self.manifest.save(self.directory)
-        self.is_new = False
-
-
-def _fresh_manifest(config: DatasetConfig, name: str, source_hash: str) -> Manifest:
-    source = config.sources[name]
-    processing = config.source_processing(name)
-    manifest = new_manifest(config, name, source_hash, "processed", tokens=True, hash_payload=config.processed_hash_payload(name))
-    stats: dict[str, Any] = {
-        "input_rows": 0,
-        "dedup": {"mode": processing.dedup.mode, "duplicates_removed": 0},
-    }
-    if source.kind == "pretrain":
-        stats["length_filter"] = {"input_samples": 0, "removed_too_short": 0, "removed_invalid": 0, "output_samples": 0}
-        stats["quality_filter"] = {"enabled": processing.quality_filter, "filtered_count": 0, "rejection_reasons": {}}
-        stats["decontamination"] = {
-            "enabled": processing.decontamination.enabled, "contaminated_count": 0, "contaminated_by_benchmark": {},
-        }  # fmt: skip
-    else:
-        stats["inverted"] = 0  # rows replaced by their input inversion (`source.input_inversions` share, seeded per row)
-        stats["removed_empty"] = 0  # rows without instruction or output after stripping
-        stats["removed_too_long"] = 0  # rows over `dataset_max_sequence_length` tokens (a safety net; the download already drops them)
-    manifest.columns = list(processed_columns(source.kind))
-    manifest.shuffled = config.shuffle_of(name)
-    manifest.shuffle_seed = source.seed
-    manifest.stats = stats
-    return manifest
 
 
 # --- the row pipeline ----------------------------------------------------------------------------------------------------
@@ -423,6 +402,8 @@ class RowPipeline:
 
         if self.kind == "pretrain":
             rows = self._pretrain_rows(raw_dir, shards)
+        elif self.source.instruction_format == "messages":
+            rows = self._message_rows(raw_dir, shards)
         else:
             rows = self._instruct_rows(raw_dir, shards, first_row_index)
         if self.seen is not None:  # dedup on (minhash = this cheap exact pass first, then fuzzy, all at once)
@@ -470,6 +451,27 @@ class RowPipeline:
                 yield from kept
 
     # --- instruct --------------------------------------------------------------------------------------------------
+
+    def _message_rows(self, raw_dir: Path, shards: list[ShardInfo]) -> Iterator[Row]:
+        raw_manifest = Manifest.load(raw_dir)
+        same_tokenizer = raw_manifest is not None and raw_manifest.tokenizer_hash == self.config.tokenizer_hash()
+        for shard in shards:
+            check_stop(self.should_stop)
+            parquet = pq.ParquetFile(raw_dir / shard.name)
+            for batch in parquet.iter_batches(batch_size=self.batch_size, columns=list(CHAT_COLUMNS)):
+                self._advance(len(batch))
+                for row in batch.to_pylist():
+                    if same_tokenizer and int(row["tokens"]) <= self.dataset_max_sequence_length:
+                        yield {**row, "hash": hash_conversation(row["messages"])}
+                        continue
+                    encoded = fit_conversation(row["messages"], self._counter().chat_tokenizer, self.dataset_max_sequence_length)
+                    chat = self.stats.setdefault("conversation", {})
+                    chat["removed_exchanges"] = chat.get("removed_exchanges", 0) + encoded.removed_exchanges
+                    if not encoded.messages:
+                        self.stats["removed_too_long"] += 1
+                        continue
+                    yield {"messages": encoded.messages, "exchange_ends": encoded.exchange_ends,
+                           "tokens": len(encoded.ids), "hash": hash_conversation(encoded.messages)}
 
     def _instruct_rows(self, raw_dir: Path, shards: list[ShardInfo], first_row_index: int) -> Iterator[Row]:
         """
@@ -554,6 +556,23 @@ def _exact_dedup(rows: Iterator[Row], seen: SeenDocuments, stats: dict[str, Any]
         yield row
 
 
+def _new_hashes(hashes: list[int], seen: SeenDocuments | None, stats: dict[str, Any]) -> list[int]:
+    """
+    The indices of the hashes that survive :func:`_exact_dedup`'s rule (first occurrence wins; every index without
+    a filter), for rows that stayed in a worker process.
+    """
+
+    if seen is None:
+        return list(range(len(hashes)))
+    keep: list[int] = []
+    for index, hash64 in enumerate(hashes):
+        if seen.add_if_new(hash64):
+            keep.append(index)
+        else:
+            stats["duplicates_removed"] += 1
+    return keep
+
+
 def _quality_filter(rows: Iterator[Row], stats: dict[str, Any]) -> Iterator[Row]:
     """
     Drop rows failing check_quality; counts the rejections per reason in stats.
@@ -582,12 +601,16 @@ _BENCHMARK_NGRAMS: dict[str, set[str]] = {}
 _DECONTAM: dict[str, Any] = {}
 
 
-def _init_decontamination(ngrams: dict[str, set[str]], n: int, threshold: float) -> None:
+def _init_decontamination(
+    ngrams: dict[str, set[str]], n: int, threshold: float, debug: WorkerDebugOptions | None = None,
+) -> None:
     global _BENCHMARK_NGRAMS
     _BENCHMARK_NGRAMS = ngrams
     _DECONTAM.update({"n": n, "threshold": threshold})
+    initialize_worker_debug(debug, "decontamination")
 
 
+@measured_worker("decontamination")
 def _contaminated_by(text: str) -> list[str]:
     """
     Benchmarks text is contaminated by, using the worker-global n-grams of _init_decontamination.
@@ -620,7 +643,7 @@ class Decontaminator:
             return self
         self._ngrams = load_benchmark_ngrams(list(self.config.benchmarks), self.config.ngram, self.cache_dir)
         if self.pass_workers > 1:
-            init_args = (self._ngrams, self.config.ngram, self.config.threshold)
+            init_args = (self._ngrams, self.config.ngram, self.config.threshold, worker_debug_options())
             self._pool = ProcessPoolExecutor(
                 max_workers=self.pass_workers,
                 mp_context=multiprocessing.get_context("spawn"),
@@ -631,7 +654,8 @@ class Decontaminator:
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         if self._pool is not None:
-            self._pool.shutdown(cancel_futures=True)  # a build that stopped early does not wait for the queued chunks
+            with measure("worker_shutdown"):
+                self._pool.shutdown(cancel_futures=True)  # a build that stopped early does not wait for queued chunks
             self._pool = None
 
     def __call__(self, rows: Iterator[Row]) -> Iterator[Row]:
@@ -650,12 +674,15 @@ class Decontaminator:
 
         if self._pool is None:
             for row in rows:
-                yield row, check_contamination(row["text"], self._ngrams, self.config.ngram, self.config.threshold)[1]
+                with measure("decontamination"):
+                    contaminated = check_contamination(row["text"], self._ngrams, self.config.ngram, self.config.threshold)[1]
+                yield row, contaminated
             return
         for chunk in chunks(rows, 1024):
             texts = [row["text"] for row in chunk]
             try:
-                hits = list(self._pool.map(_contaminated_by, texts, chunksize=64))
+                with measure("worker_result_wait"):
+                    hits = list(self._pool.map(_contaminated_by, texts, chunksize=64))
             except BrokenProcessPool as error:
                 raise RuntimeError(
                     f"a decontamination worker died, likely OOM-killed ({error}); every worker holds its own copy of "

@@ -1,7 +1,7 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """
 prepare.py describe: render a dataset config as a Markdown document (docs/data_mixture.md is generated
-with it, so the documentation of the thesis mixture cannot drift from config/datasets/crow_300m_final.yaml).
+with it, so the dataset documentation cannot drift from config/datasets/crow_300m_final.yaml).
 
 Pure function of the config file: tokenizer, sequence length and processing defaults, one table per stage (weights,
 derived token budgets and estimated row counts), the validation split per source and the source registry. The
@@ -18,7 +18,7 @@ from fractions import Fraction
 from math import ceil
 from pathlib import Path
 
-from data_preparation.dataset_config import DatasetConfig, ProcessingConfig, SourceConfig, TokenizerConfig
+from data_preparation.lib.dataset_config import DatasetConfig, ProcessingConfig, SourceConfig, TokenizerConfig
 
 GENERATED_WITH = "uv run python data_preparation/prepare.py describe --dataset_config {config}"
 
@@ -42,7 +42,7 @@ def describe(config: DatasetConfig, config_path: str | Path, notes: str = "") ->
         "Do not edit by hand: change the dataset config and regenerate. Token budgets are the stage budgets of the",
         "config times the stage weights; the training loader packs rows end to end, so a",
         "source is consumed by the token length of its rows. The training stream realises the weights as token shares by",
-        "filling its packing pool from the source with the largest token deficit (`BatchStream` in `training/step.py`;",
+        "filling its packing pool from the source with the largest token deficit (`BatchStream` in `training/steps/batches.py`;",
         "equal deficits go to the alphabetically smallest source name, so the order of the `sources:` block below never",
         "changes the stream).",
         "The rows columns estimate how many rows that is from",
@@ -232,6 +232,8 @@ def _details(config: DatasetConfig, name: str) -> str:
         parts.append("fields " + ", ".join(f"{field}←`{column}`" for field, column in source.fields.items()))
     if source.converter:
         parts.append(f"converter `{source.converter}`")
+    if source.instruction_format == "messages":
+        parts.append("complete-exchange messages; assistant-only supervision")
     if source.filter:
         parts.append(f"filter `{source.filter}`")
     if source.check_limit is not None:

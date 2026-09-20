@@ -31,6 +31,7 @@ from training.ui.common import TRAINING_LOGGER_NAME, Clock, lines_log, log
 from training.ui.format import (
     depth_losses,
     METRIC_COLUMNS,
+    RECURRENCE_METRIC_KEYS,
     event_line,
     fit_panel_heights,
     floats,
@@ -46,7 +47,7 @@ from ui.display import LiveDisplay, line
 
 DEFAULT_LOG_LINES = 12
 DEFAULT_EVENT_LINES = 6
-DEFAULT_REFRESH_PER_SECOND = 4  # bounded: the live display redraws on its own timer, never per optimizer step
+DEFAULT_REFRESH_PER_SECOND = 2  # poll for content changes every 500 ms; time-only frames wait up to 10 s
 
 
 @dataclass
@@ -100,17 +101,21 @@ class TrainingDashboard(LiveDisplay):
         stream: TextIO | None = None,
         fallback_stream: TextIO | None = None,
         clock: Clock = time.monotonic,
+        show_micro_batches: bool = False,
     ) -> None:
         if len(stage_names) != len(steps_per_stage):
             raise ValueError(f"{len(stage_names)} stage names for {len(steps_per_stage)} step counts")
         self.run_name = run_name
+        self.show_micro_batches = show_micro_batches  # DASHBOARD_SHOW_MICRO_BATCHES: a bar of the running step's micro-batches
         self.stage_names = list(stage_names)
         self.steps_per_stage = list(steps_per_stage)
         self.total_steps = total_steps
         self.details = dict(details or {})
         self.log_step_interval = max(int(log_step_interval), 1)
         super().__init__(
-            stream=stream if stream is not None else sys.stdout, console=console, refresh_per_second=refresh_per_second, log_lines=log_lines
+            stream=stream if stream is not None else sys.stdout, console=console,
+            refresh_per_second=min(max(refresh_per_second, 0.1), DEFAULT_REFRESH_PER_SECOND), log_lines=log_lines,
+            get_refresh_key=self._snapshot_for_refresh, refresh_clock=clock, overwrite_frames=True,
         )
         # plain lines once the display is gone: the run's fallback stream when it has one, else the display's own stream
         if fallback_stream is not None:
@@ -130,6 +135,9 @@ class TrainingDashboard(LiveDisplay):
         self._stage_starts = [sum(self.steps_per_stage[:i]) for i in range(len(self.steps_per_stage))]
         self._bars = [StageBar(name, steps) for name, steps in zip(self.stage_names, self.steps_per_stage)]
         self._overall = StageBar("overall", total_steps, marker="", style="bold")
+        # the micro-batches of the running optimizer step (rank 0's share): filled by `update_micro_batch`, reset by
+        # `update_step`; total 0 until the first micro-batch is reported
+        self._micro = StageBar("micro-batches", 0, marker="", style="dim")
         self._open = False
         self.logger = log
         self._capture = TerminalCapture(self, already_attached=self.is_attached)
@@ -309,6 +317,17 @@ class TrainingDashboard(LiveDisplay):
         with self._lock:
             self._throughput.discount(seconds)
 
+    def update_micro_batch(self, completed: int, total: int) -> None:
+        """
+        completed of the total micro-batches of the running optimizer step are done on this rank (rank 0).
+        Shown as a bar under the overall bar with show_micro_batches (DASHBOARD_SHOW_MICRO_BATCHES), ignored
+        otherwise; update_step resets the bar for the next step. O(1), no log line.
+        """
+
+        if not self.show_micro_batches:
+            return
+        self._guarded(lambda: self._apply_micro_batch(completed, total))
+
     def update_validation(self, step: int, losses: Mapping[str, object]) -> None:
         """
         The validation losses measured after step (per recurrence depth, e.g. val_loss_4, and per source,
@@ -344,6 +363,13 @@ class TrainingDashboard(LiveDisplay):
             self._stage_index = stage_index
             self._latest.update(known)
             self._refresh_bars(step, stage_index)
+            self._micro.completed = 0  # the step is done: the next step's micro-batches count from 0 again
+
+    def _apply_micro_batch(self, completed: int, total: int) -> None:
+        with self._lock:
+            self._micro.total = max(int(total), 0)
+            self._micro.completed = min(max(int(completed), 0), self._micro.total)
+            self._micro.note = f"of step {self._step}"
 
     def _refresh_bars(self, step: int, stage_index: int) -> None:
         last_index = len(self._bars) - 1
@@ -422,6 +448,20 @@ class TrainingDashboard(LiveDisplay):
 
     # --- rendering ------------------------------------------------------------------------------------------------------
 
+    def _snapshot_for_refresh(self) -> object:
+        """Copy the displayed state without elapsed time or the overall bar's time-derived note."""
+
+        with self._lock:
+            bars = tuple((bar.name, bar.total, bar.completed, bar.note, bar.marker, bar.style) for bar in self._bars)
+            micro = (self._micro.total, self._micro.completed, self._micro.note) if self.show_micro_batches else None
+            validation = None if self._validation is None else (self._validation[0], tuple(self._validation[1].items()))
+            return (
+                self.run_name, tuple(self.details.items()), self._status, self._step, bars,
+                self._overall.total, self._overall.completed, micro, tuple(self._latest.items()), validation,
+                self._throughput.seconds_per_step, tuple(self._events), tuple(self._panel_lines),
+                self._panel_height, self._log_file,
+            )
+
     def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
         try:
             with self._lock:
@@ -485,14 +525,26 @@ class TrainingDashboard(LiveDisplay):
                 f"{bar.percentage:>3.0f}%",
                 bar.note,
             )
+        if self.show_micro_batches:
+            micro = self._micro  # an empty bar before the first micro-batch of the run, not a full one
+            grid.add_row(
+                line(micro.name, style=micro.style),
+                ProgressBar(total=max(micro.total, 1), completed=micro.completed),
+                f"{micro.completed}/{micro.total}",
+                f"{micro.percentage if micro.total > 0 else 0.0:>3.0f}%",
+                micro.note,
+            )
         return grid
 
     def _render_metrics(self) -> RenderableType:
         table = Table(
-            box=box.SIMPLE_HEAD, show_edge=False, pad_edge=False, title=line(f"step {self._step}"), title_justify="left"
+            box=box.SIMPLE_HEAD, show_edge=False, pad_edge=False, collapse_padding=True,
+            title=line(f"step {self._step}"), title_justify="left"
         )
         cells: list[str] = []
         for key, label in METRIC_COLUMNS:
+            if key in RECURRENCE_METRIC_KEYS and key not in self._latest:
+                continue  # appear on the first probe, then retain the latest measurement between probes
             table.add_column(label, justify="right", no_wrap=True)
             value = self._latest.get(key)
             if value is None and key == "seconds/step":

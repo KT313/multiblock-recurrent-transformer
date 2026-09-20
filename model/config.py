@@ -5,7 +5,9 @@ Architecture configuration of the multi-block recurrent transformer (the `crow-3
 """
 
 import json
+import math
 from dataclasses import asdict, dataclass, field, fields
+from numbers import Integral, Real
 from pathlib import Path
 from typing import Any, Literal
 
@@ -24,20 +26,29 @@ def find_multiple(value: int, multiple: int) -> int:
     return value + multiple - (value % multiple)
 
 
+def validate_positive_real(name: str, value: object) -> None:
+    """Reject coercible strings, booleans and nonfinite scalars without changing valid values."""
+    if isinstance(value, bool) or not isinstance(value, Real) or value <= 0 or (not isinstance(value, Integral) and not math.isfinite(value)):
+        raise ValueError(f"{name} must be > 0 and a finite real scalar, got {value!r}")
+
+
 @dataclass
 class RoPESettings:
-    rope_base: int = 50_000
+    rope_base: float = 50_000
+
+    def __post_init__(self) -> None:
+        validate_positive_real("rope_base", self.rope_base)
 
 
 # The accepted values of `bf16_residual_stream` (see the field).
 BF16_RESIDUAL_STREAM_VALUES = ("none", "core", "all")
+RESIDUAL_SCALING_VALUES = ("none", "inverse_sqrt_depth")
 
 # Fields that only ever had one value in the thesis run. They stay in the config (and in exported config.json files)
 # so that a different value is rejected loudly instead of silently running a different architecture.
 _FIXED_FIELD_VALUES: tuple[tuple[str, object], ...] = (
     ("attn_impl", "sdpa"),
     ("init_strategy", "takase"),
-    ("init_orthogonal", True),
     ("activation_checkpoint_impl", "per-iteration"),
     ("injection_type", "linear"),
     ("state_init", "normal"),
@@ -67,6 +78,9 @@ def broadcast_per_block(name: str, value: int | list[int], num_blocks: int) -> l
 class RecurrentConfig:
     """
     Hyper-parameters of `RecurrentGPT`. Per-block fields accept an int (broadcast) or one entry per core block.
+
+    Architecture switches require actual booleans, including in YAML/JSON and overrides. `norm_eps` and
+    `rope_settings.rope_base` require positive finite real scalars; strings, booleans and nonfinite values fail.
     """
 
     # Core
@@ -84,13 +98,15 @@ class RecurrentConfig:
     attn_impl: Literal["sdpa"] = "sdpa"
     norm_eps: float = 1e-6
     qk_bias: bool = True
+    use_custom_kernels: bool = True
     # The dtype of the residual stream under autocast: "none" keeps it fp32 (the RMSNorm outputs promote to the fp32
     # weight), "core" rounds the core blocks' RMSNorm outputs to the autocast dtype so the stream inside the recurrence
     # is bf16 (prelude, coda, the residual across blocks and the block input stay fp32), "all" rounds every RMSNorm.
     # Without autocast the stream is fp32 whatever the value. Parameters, gradients and optimizer state are unaffected.
     bf16_residual_stream: Literal["none", "core", "all"] = "none"
+    residual_scaling: Literal["none", "inverse_sqrt_depth"] = "none"
     init_strategy: Literal["takase"] = "takase"
-    init_orthogonal: Literal[True] = True
+    init_orthogonal: bool = True  # False: independent normal entries truncated at +/-3 Takase standard deviations
     activation_checkpoint_impl: Literal["per-iteration"] = "per-iteration"
     # Recurrent structure
     injection_type: Literal["linear"] = "linear"
@@ -106,6 +122,9 @@ class RecurrentConfig:
     mean_backprop_depth: int | list[int] = 8
 
     def __post_init__(self) -> None:
+        for name in ("tie_embeddings", "qk_bias", "use_custom_kernels", "init_orthogonal"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be a boolean")
         # Nested settings arrive as plain dicts from YAML / JSON.
         if isinstance(self.rope_settings, dict):
             self.rope_settings = RoPESettings(**self.rope_settings)
@@ -119,6 +138,8 @@ class RecurrentConfig:
                 f"bf16_residual_stream={self.bf16_residual_stream!r} is not supported, only one of "
                 f"{BF16_RESIDUAL_STREAM_VALUES}"
             )
+        if self.residual_scaling not in RESIDUAL_SCALING_VALUES:
+            raise ValueError(f"residual_scaling={self.residual_scaling!r} is not supported; choose {RESIDUAL_SCALING_VALUES}")
 
         self._validate_sizes()
 
@@ -153,6 +174,8 @@ class RecurrentConfig:
         for n_layers, mean_recurrence in zip(self.n_layers_in_recurrent_block, self.mean_recurrence):
             recurrent_depth += n_layers * mean_recurrence
         self.effective_expected_depth = self.n_layers_in_prelude + self.n_layers_in_coda + recurrent_depth
+        # One fixed coefficient for all sandwich branches; sampled/evaluation depths never change the model map.
+        self.residual_scale = 1 / math.sqrt(self.effective_expected_depth) if self.residual_scaling == "inverse_sqrt_depth" else 1.0
 
         # Largest number of core-block layers the gradient can flow through (layers times the backprop cap, summed);
         # the actual number is lower whenever a block draws fewer than `mean_backprop_depth` iterations.
@@ -160,7 +183,7 @@ class RecurrentConfig:
         for n_layers, mean_backprop_depth in zip(self.n_layers_in_recurrent_block, self.mean_backprop_depth):
             self.max_backprop_layers += n_layers * mean_backprop_depth
 
-        self.init = Init(self.n_embd, self.head_size, self.effective_expected_depth)
+        self.init = Init(self.n_embd, self.head_size, self.effective_expected_depth, orthogonal=self.init_orthogonal)
 
     def _validate_sizes(self) -> None:
         """
@@ -181,10 +204,10 @@ class RecurrentConfig:
         # None means "4 * n_embd", filled in below.
         if self.intermediate_size is not None and self.intermediate_size < 1:
             raise ValueError(f"intermediate_size must be >= 1, got {self.intermediate_size}")
-        if self.norm_eps <= 0:
-            raise ValueError(f"norm_eps must be > 0, got {self.norm_eps}")
-        if self.rope_settings.rope_base <= 0:
-            raise ValueError(f"rope_base must be > 0, got {self.rope_settings.rope_base}")
+        validate_positive_real("norm_eps", self.norm_eps)
+        if not isinstance(self.rope_settings, RoPESettings):
+            raise ValueError("rope_settings must be a RoPESettings instance or mapping")
+        validate_positive_real("rope_base", self.rope_settings.rope_base)
 
     def _validate_recurrence(self) -> None:
         """

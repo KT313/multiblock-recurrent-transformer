@@ -8,11 +8,12 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
 
 import model.model as model_module
 from model.layers.norms import RMSNorm
@@ -28,6 +29,7 @@ from model.hf.modeling import (
     flatten_relative_imports,
     mask_padded_vocabulary,
     parse_recurrence_steps,
+    resolve_special_token_ids,
 )
 
 
@@ -137,8 +139,9 @@ def test_export_sources_rejects_flat_name_clash(tmp_path: Path) -> None:
         export_sources(pkg, tmp_path / "out")
 
 
-def test_config_round_trip() -> None:
-    cfg = tiny_config(rope_settings=RoPESettings(rope_base=12_345), mean_recurrence=[3, 5])
+@pytest.mark.parametrize('orthogonal', [True, False])
+def test_config_round_trip(orthogonal: bool) -> None:
+    cfg = tiny_config(rope_settings=RoPESettings(rope_base=12_345), mean_recurrence=[3, 5], init_orthogonal=orthogonal)
     hf_cfg = RecurrentGPTConfig.from_recurrent_config(cfg)
     assert hf_cfg.model_type == "recurrent_gpt"
     assert hf_cfg.rope_base == 12_345
@@ -181,11 +184,13 @@ def test_hf_config_defaults_are_the_dataclass_defaults() -> None:
     assert hf_cfg.to_recurrent_config() == defaults
 
 
-def test_hf_config_survives_json_round_trip(tmp_path: Path) -> None:
-    hf_cfg = RecurrentGPTConfig.from_recurrent_config(tiny_config())
+@pytest.mark.parametrize('scaling', ['none', 'inverse_sqrt_depth'])
+def test_hf_config_survives_json_round_trip(tmp_path: Path, scaling: str) -> None:
+    hf_cfg = RecurrentGPTConfig.from_recurrent_config(tiny_config(residual_scaling=scaling))
     hf_cfg.save_pretrained(tmp_path)
     loaded = RecurrentGPTConfig.from_pretrained(tmp_path)
     assert loaded.to_recurrent_config() == hf_cfg.to_recurrent_config()
+    assert loaded.to_recurrent_config().residual_scale == hf_cfg.to_recurrent_config().residual_scale
 
 
 def tiny_hf_model() -> RecurrentGPTForCausalLM:
@@ -483,6 +488,38 @@ def test_embedding_accessors() -> None:
     assert hf_model.get_output_embeddings() is new_head
 
 
+@pytest.mark.parametrize("tied", [True, False])
+@pytest.mark.parametrize(("new_num_tokens", "pad_to_multiple_of"), [(500, None), (520, None), (512, None), (None, 1024)])
+def test_vocabulary_resize_rejected_without_mutation(
+    tied: bool, new_num_tokens: int | None, pad_to_multiple_of: int | None,
+) -> None:
+    hf_model = RecurrentGPTForCausalLM(RecurrentGPTConfig.from_recurrent_config(tiny_config(tie_embeddings=tied)))
+    embedding = hf_model.get_input_embeddings()
+    head = hf_model.get_output_embeddings()
+    parameters = dict(hf_model.named_parameters())
+    weights = {name: parameter.detach().clone() for name, parameter in parameters.items()}
+    hf_config = hf_model.config.to_dict()
+    native_config = hf_model.model.config.to_dict()
+    rng = torch.get_rng_state().clone()
+
+    with pytest.raises(NotImplementedError, match="Vocabulary resizing is not supported.*before constructing"):
+        hf_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of, mean_resizing=False)
+
+    assert hf_model.get_input_embeddings() is embedding
+    assert hf_model.get_output_embeddings() is head
+    assert hf_model.config.to_dict() == hf_config
+    assert hf_model.model.config.to_dict() == native_config
+    assert torch.equal(torch.get_rng_state(), rng)
+    for name, parameter in hf_model.named_parameters():
+        assert parameter is parameters[name]
+        assert torch.equal(parameter, weights[name])
+
+
+def test_vocabulary_resize_without_arguments_remains_an_embedding_lookup() -> None:
+    hf_model = tiny_hf_model()
+    assert hf_model.resize_token_embeddings() is hf_model.get_input_embeddings()
+
+
 def test_prepare_inputs_for_generation_forwards_the_mask_and_the_row_positions() -> None:
     hf_model = tiny_hf_model()
     x = ids(1, 4)
@@ -498,18 +535,173 @@ def test_prepare_inputs_for_generation_forwards_the_mask_and_the_row_positions()
 
 def test_export_with_tokenizer_and_nested_dir(tmp_path: Path, tiny_tokenizer_dir: Path) -> None:
     torch.manual_seed(0)
-    model = build_model(TINY_ARCHITECTURE)
+    model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False)
     out_dir = export_to_hf(model, model.config, tmp_path / "a" / "b", tokenizer_dir=tiny_tokenizer_dir)
     assert out_dir == tmp_path / "a" / "b"
     tok = AutoTokenizer.from_pretrained(out_dir)
     ref = AutoTokenizer.from_pretrained(tiny_tokenizer_dir)
     assert tok("hello world")["input_ids"] == ref("hello world")["input_ids"]
+    loaded = load_exported(out_dir)
+    for name in ("bos_token_id", "eos_token_id", "pad_token_id"):
+        assert getattr(loaded.config, name) == getattr(loaded.generation_config, name) == getattr(tok, name)
+    assert loaded.generation_config.pad_token_id == 0
+    assert_stops_on_token(loaded, 2)
 
 
-def test_export_and_reload_with_trust_remote_code(tmp_path: Path) -> None:
+class ForceToken(LogitsProcessor):
+    def __init__(self, token_id: int) -> None:
+        self.token_id = token_id
+
+    # transformers annotates scores as FloatTensor, but generation passes an ordinary Tensor.
+    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:  # pyright: ignore[reportIncompatibleMethodOverride]
+        scores.fill_(float("-inf"))
+        scores[:, self.token_id] = 0
+        return scores
+
+
+def assert_stops_on_token(model: RecurrentGPTForCausalLM, token_id: int) -> None:
+    prompt = ids(1, 4)
+    generated = model.generate(
+        prompt, attention_mask=torch.ones_like(prompt), max_new_tokens=5, do_sample=False,
+        logits_processor=LogitsProcessorList([ForceToken(token_id)]),
+    )
+    assert generated.shape == (1, 5)
+    assert generated[0, -1].item() == token_id
+
+
+@pytest.mark.parametrize("eos", [0, [0, 2]])
+def test_explicit_export_with_optional_ids_absent(tmp_path: Path, eos: int | list[int]) -> None:
+    model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False)
+    out_dir = export_to_hf(model, model.config, tmp_path / "export", eos_token_id=eos)
+    loaded = load_exported(out_dir)
+    for filename in ("config.json", "generation_config.json"):
+        metadata = json.loads((out_dir / filename).read_text())
+        assert metadata["eos_token_id"] == eos
+        assert metadata.get("bos_token_id") is None and metadata.get("pad_token_id") is None
+    for token_id in eos if isinstance(eos, list) else [eos]:
+        assert_stops_on_token(loaded, token_id)
+
+
+def test_tokenizer_instance_explicit_supplement_does_not_mutate_source(
+    tmp_path: Path, tiny_tokenizer_dir: Path,
+) -> None:
+    tokenizer = AutoTokenizer.from_pretrained(tiny_tokenizer_dir)
+    tokenizer.bos_token = None
+    tokenizer.pad_token = None
+    model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False)
+    out_dir = export_to_hf(model, model.config, tmp_path / "export", tokenizer=tokenizer, bos_token_id=1, eos_token_id=[2])
+    saved = AutoTokenizer.from_pretrained(out_dir)
+    assert saved.bos_token_id == 1 and saved.pad_token_id is None and saved.eos_token_id == 2
+    assert tokenizer.bos_token_id is None and tokenizer.pad_token_id is None
+    assert len(saved) == len(tokenizer)
+
+
+@pytest.mark.parametrize("field", ["bos_token_id", "eos_token_id", "pad_token_id"])
+@pytest.mark.parametrize("invalid", [True, False, 1.5, "2", -1, 511, [], [True], [2, -1]])
+def test_invalid_metadata_fails_before_output_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, invalid: object,
+) -> None:
+    # 511 is a padded-only row: the tiny model still has 512 physical rows.
+    model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False, vocab_size=511)
+    out_dir = tmp_path / "export"
+    out_dir.mkdir()
+    sentinel = out_dir / "config.json"
+    sentinel.write_text("existing export")
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        pytest.fail("invalid metadata reached weight access")
+
+    monkeypatch.setattr(model, "state_dict", forbidden)
+    kwargs = {"eos_token_id": 2, field: invalid}
+    with pytest.raises(ValueError, match=field):
+        export_to_hf(model, model.config, out_dir, **cast(dict[str, Any], kwargs))
+    assert list(out_dir.iterdir()) == [sentinel] and sentinel.read_text() == "existing export"
+
+
+def test_missing_and_conflicting_metadata_fail_before_directory_creation(
+    tmp_path: Path, tiny_tokenizer_dir: Path,
+) -> None:
+    model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False)
+    out_dir = tmp_path / "export"
+    with pytest.raises(ValueError, match="allow_missing_generation_metadata=True"):
+        export_to_hf(model, model.config, out_dir)
+    with pytest.raises(ValueError, match="eos_token_id conflicts"):
+        export_to_hf(model, model.config, out_dir, tiny_tokenizer_dir, eos_token_id=3)
+    tokenizer = AutoTokenizer.from_pretrained(tiny_tokenizer_dir)
+    with pytest.raises(ValueError, match="either tokenizer_dir or tokenizer"):
+        export_to_hf(model, model.config, out_dir, tiny_tokenizer_dir, tokenizer=tokenizer)
+    assert not out_dir.exists()
+    out_dir = export_to_hf(model, model.config, out_dir, allow_missing_generation_metadata=True)
+    loaded = load_exported(out_dir)
+    assert loaded.config.eos_token_id is None and loaded.generation_config.eos_token_id is None
+
+
+def test_tokenizer_metadata_is_validated_after_loading(tiny_tokenizer_dir: Path) -> None:
+    tokenizer = AutoTokenizer.from_pretrained(tiny_tokenizer_dir)
+    with pytest.raises(ValueError, match="eos_token_id"):
+        resolve_special_token_ids(2, tokenizer)
+    tokenizer.bos_token = None
+    with pytest.raises(ValueError, match="unknown to the tokenizer"):
+        resolve_special_token_ids(1024, tokenizer, bos_token_id=1000)
+
+
+@pytest.mark.parametrize("eos", [3, None])
+def test_tokenizer_free_export_refuses_existing_tokenizer_without_mutation(
+    tmp_path: Path, tiny_tokenizer_dir: Path, monkeypatch: pytest.MonkeyPatch, eos: int | None,
+) -> None:
+    model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False)
+    out_dir = export_to_hf(model, model.config, tmp_path / "export", tiny_tokenizer_dir)
+    assert AutoTokenizer.from_pretrained(out_dir).eos_token_id == 2
+    before = {path.relative_to(out_dir): path.read_bytes() for path in out_dir.rglob("*") if path.is_file()}
+
+    with monkeypatch.context() as patch:
+        def forbidden(*args: object, **kwargs: object) -> None:
+            pytest.fail("ambiguous tokenizer reuse reached weight access")
+
+        patch.setattr(model, "state_dict", forbidden)
+        with pytest.raises(ValueError, match="fresh directory or supply a tokenizer"):
+            export_to_hf(model, model.config, out_dir, eos_token_id=eos, allow_missing_generation_metadata=eos is None)
+
+    after = {path.relative_to(out_dir): path.read_bytes() for path in out_dir.rglob("*") if path.is_file()}
+    assert after == before
+    # A clean explicit-only/model-only destination remains supported with the requested metadata.
+    fresh = export_to_hf(
+        model, model.config, tmp_path / "fresh", eos_token_id=eos, allow_missing_generation_metadata=eos is None,
+    )
+    loaded = load_exported(fresh)
+    assert loaded.config.eos_token_id == loaded.generation_config.eos_token_id == eos
+    # Supplying the tokenizer also makes reuse unambiguous.
+    export_to_hf(model, model.config, out_dir, tiny_tokenizer_dir)
+    assert AutoTokenizer.from_pretrained(out_dir).eos_token_id == load_exported(out_dir).generation_config.eos_token_id == 2
+
+
+@pytest.mark.parametrize("artifact", ["tokenizer_config.json", "tokenizer.json", "vocab.txt", "spiece.model"])
+def test_tokenizer_free_export_refuses_partial_tokenizer_artifacts(tmp_path: Path, artifact: str) -> None:
+    model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False)
+    path = tmp_path / artifact
+    path.write_bytes(b"existing tokenizer artifact")
+    with pytest.raises(ValueError, match="fresh directory or supply a tokenizer"):
+        export_to_hf(model, model.config, tmp_path, eos_token_id=3)
+    assert list(tmp_path.iterdir()) == [path]
+    assert path.read_bytes() == b"existing tokenizer artifact"
+
+
+def test_saved_config_revalidates_special_token_ids(tmp_path: Path) -> None:
+    config = RecurrentGPTConfig.from_recurrent_config(tiny_config(vocab_size=511), eos_token_id=2)
+    config.save_pretrained(tmp_path)
+    path = tmp_path / "config.json"
+    saved = json.loads(path.read_text())
+    saved["eos_token_id"] = 511
+    path.write_text(json.dumps(saved))
+    with pytest.raises(ValueError, match="eos_token_id"):
+        RecurrentGPTConfig.from_pretrained(tmp_path)
+
+
+@pytest.mark.parametrize('scaling', ['none', 'inverse_sqrt_depth'])
+def test_export_and_reload_with_trust_remote_code(tmp_path: Path, scaling: str) -> None:
     torch.manual_seed(0)
-    model = build_model(TINY_ARCHITECTURE)
-    out_dir = export_to_hf(model, model.config, tmp_path / "export")
+    model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False, residual_scaling=scaling)
+    out_dir = export_to_hf(model, model.config, tmp_path / "export", allow_missing_generation_metadata=True)
     names = {p.name for p in out_dir.iterdir()}
     assert {"config.json", "model.safetensors", "hf_modeling.py", "model.py", "config.py", "layers_norms.py"} <= names
     assert not any(n.startswith("test_") for n in names)
@@ -518,6 +710,8 @@ def test_export_and_reload_with_trust_remote_code(tmp_path: Path) -> None:
     cfg = AutoConfig.from_pretrained(out_dir, trust_remote_code=True)
     assert cfg.model_type == "recurrent_gpt"
     loaded = load_exported(out_dir)
+    assert loaded.model.config.residual_scaling == scaling
+    assert loaded.model.config.residual_scale == model.config.residual_scale
     # In-process, transformers resolves the registered class from `model.hf.modeling` (see the standalone test for the copied
     # sources); the weights nevertheless come from the exported safetensors.
     assert isinstance(loaded, RecurrentGPTForCausalLM)
@@ -538,13 +732,13 @@ def test_export_and_reload_with_trust_remote_code(tmp_path: Path) -> None:
 
 def test_generate_runs(tmp_path: Path) -> None:
     torch.manual_seed(0)
-    model = build_model(TINY_ARCHITECTURE)
-    out_dir = export_to_hf(model, model.config, tmp_path / "export")
+    model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False)
+    out_dir = export_to_hf(model, model.config, tmp_path / "export", allow_missing_generation_metadata=True)
     loaded = load_exported(out_dir)
     prompt = ids(1, 8)
     torch.manual_seed(1)
     # transformers' `GenerativePreTrainedModel` protocol lists attributes PreTrainedModel only sets dynamically.
-    gen = loaded.generate(prompt, max_new_tokens=4, do_sample=False)  # type: ignore[misc]
+    gen = loaded.generate(prompt, max_new_tokens=4, do_sample=False)
     assert isinstance(gen, torch.Tensor)
     assert gen.shape == (1, 12)
     assert torch.equal(gen[:, :8], prompt)
@@ -558,8 +752,8 @@ def test_exported_folder_loads_standalone_without_the_repo(tmp_path: Path) -> No
     """
 
     torch.manual_seed(0)
-    model = build_model(TINY_ARCHITECTURE)
-    out_dir = export_to_hf(model, model.config, tmp_path / "export")
+    model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False)
+    out_dir = export_to_hf(model, model.config, tmp_path / "export", bos_token_id=1, eos_token_id=2, pad_token_id=0)
     model.eval()
     x = ids()
     torch.manual_seed(1)
@@ -570,12 +764,25 @@ import importlib.util, sys
 assert importlib.util.find_spec("model") is None, "repo package importable; test would not be standalone"
 import torch
 from transformers import AutoModelForCausalLM
+from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
 loaded = AutoModelForCausalLM.from_pretrained({str(out_dir)!r}, trust_remote_code=True).train(False)
 assert type(loaded).__module__.startswith("transformers_modules"), type(loaded).__module__
+assert loaded.execution_policy().precision is None
+with loaded.execution_policy().autocast("cpu"):
+    assert not torch.is_autocast_enabled("cpu")
 data = torch.load({str(tmp_path / "ref.pt")!r}, weights_only=True)
 torch.manual_seed(1)
 got = loaded(data["x"]).logits
 torch.testing.assert_close(got, data["ref"], atol=1e-5, rtol=0)
+class ForceEOS(LogitsProcessor):
+    def __call__(self, input_ids, scores):
+        scores.fill_(float("-inf"))
+        scores[:, 2] = 0
+        return scores
+assert loaded.config.eos_token_id == loaded.generation_config.eos_token_id == 2
+prompt = data["x"][:1, :4]
+output = loaded.generate(prompt, max_new_tokens=5, do_sample=False, logits_processor=LogitsProcessorList([ForceEOS()]))
+assert output.shape == (1, 5) and output[0, -1].item() == 2
 print("STANDALONE_OK")
 """
     env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH",)}
@@ -597,3 +804,66 @@ def test_hf_config_carries_bf16_residual_stream(tmp_path: Path) -> None:
     core_norm = cast(RMSNorm, model.model.get_submodule("transformer.core_blocks.0.0.norm_1"))
     prelude_norm = cast(RMSNorm, model.model.get_submodule("transformer.prelude.0.norm_1"))
     assert core_norm.autocast_output is True and prelude_norm.autocast_output is False
+
+
+@pytest.mark.parametrize("precision", [None, "32", "bf16-mixed"])
+def test_export_execution_metadata_is_optional_and_nonarchitectural(tmp_path: Path, precision: str | None) -> None:
+    from model.execution import ExecutionPolicy
+
+    model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False)
+    policy = None if precision is None else ExecutionPolicy(precision)
+    out_dir = export_to_hf(model, model.config, tmp_path / "export", execution_policy=policy, allow_missing_generation_metadata=True)
+    loaded = load_exported(out_dir)
+    assert loaded.config.execution_precision == precision
+    assert loaded.model.config == model.config
+    assert loaded.execution_policy() == ExecutionPolicy(precision)
+    assert (out_dir / "execution.py").is_file()
+    assert "execution_precision" not in loaded.model.config.to_dict()
+    with loaded.execution_policy().autocast("cpu"):
+        assert torch.is_autocast_enabled("cpu") == (precision == "bf16-mixed")
+
+
+def test_execution_metadata_preserves_positional_rope_configuration() -> None:
+    config = RecurrentGPTConfig(None, {"rope_base": 1234}, execution_precision="bf16-mixed")
+    assert config.rope_base == 1234 and config.execution_precision == "bf16-mixed"
+
+
+@pytest.mark.parametrize("values,field", [
+    ({"tie_embeddings": "false"}, "tie_embeddings"),
+    ({"qk_bias": 1}, "qk_bias"),
+    ({"norm_eps": float("nan")}, "norm_eps"),
+    ({"rope_base": True}, "rope_base"),
+    ({"rope_base": "50000"}, "rope_base"),
+    ({"rope_base": float("inf")}, "rope_base"),
+    ({"rope_base": True, "rope_settings": {"rope_base": 1}}, "rope_base"),
+    ({"rope_settings": {"rope_base": float("nan")}}, "rope_base"),
+])
+def test_hf_config_rejects_invalid_native_values(values: dict[str, Any], field: str) -> None:
+    with pytest.raises(ValueError, match=field):
+        RecurrentGPTConfig(**values)
+
+
+def test_hf_config_preserves_fractional_rope_base_and_rejects_close_conflicts() -> None:
+    config = RecurrentGPTConfig(rope_base=12.5)
+    assert config.to_recurrent_config().rope_settings.rope_base == 12.5
+    with pytest.raises(ValueError, match="disagree"):
+        RecurrentGPTConfig(rope_base=12.5, rope_settings={"rope_base": 12.6})
+    config.rope_base = True
+    with pytest.raises(ValueError, match="rope_base"):
+        config.to_recurrent_config()
+
+
+@pytest.mark.parametrize("text", ["0", "-1", "4,0", "1.5", "true", "nan", "1,2,3"])
+def test_hf_text_depth_rejects_invalid_specifications(text: str) -> None:
+    with pytest.raises(ValueError):
+        parse_recurrence_steps(text, 2)
+
+
+@pytest.mark.parametrize("steps", [True, 1.5, torch.tensor([1, 2, 3]), [(1, 0), (False, 0)]])
+def test_hf_invalid_depth_precedes_recurrence(monkeypatch: pytest.MonkeyPatch, steps: Any) -> None:
+    model = RecurrentGPTForCausalLM(RecurrentGPTConfig.from_recurrent_config(tiny_config()))
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("invalid explicit depth reached recurrence")
+    monkeypatch.setattr(model.model, "run_core_blocks", forbidden)
+    with pytest.raises(ValueError, match="num_steps"):
+        model(ids(1, 2), num_steps=steps)

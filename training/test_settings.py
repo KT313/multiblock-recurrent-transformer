@@ -75,7 +75,7 @@ CROW_EXPLICIT: dict[str, Any] = {
     "cooldown_steps": 64,
     "min_lr": 0.0,
     "log_step_interval": 1,
-    "log_gradient_metrics": True,
+    "log_gradient_metrics_interval": 1,
     "eval_step_interval": 16,
     "eval_iters": 64,
     "partial_depth_eval": [1, 2, 4, 8, 16],
@@ -350,7 +350,7 @@ def test_validation_misaligned_eval_and_log_intervals() -> None:
 
 @pytest.mark.parametrize("log,eval_", [(1, 1), (1, 100), (4, 4), (4, 16), (5, 100)])
 def test_validation_aligned_eval_and_log_intervals(log: int, eval_: int) -> None:
-    cfg = _settings(log_step_interval=log, eval_step_interval=eval_)
+    cfg = _settings(log_step_interval=log, eval_step_interval=eval_, log_gradient_metrics_interval=0)
     assert (cfg.log_step_interval, cfg.eval_step_interval) == (log, eval_)
 
 
@@ -476,7 +476,7 @@ def test_the_optimizer_and_schedule_names_are_checked_at_construction() -> None:
     assert OPTIMIZERS == BUILDABLE_OPTIMIZERS and LR_SCHEDULES == IMPLEMENTED_SCHEDULES  # torch-free copies
     for name in OPTIMIZERS:
         assert _settings(optimizer=name).optimizer == name
-    with pytest.raises(ValueError, match="optimizer must be one of AdamW, ELLISAdam, not 'Adam'"):
+    with pytest.raises(ValueError, match="optimizer must be one of AdamW, ELLISAdam, ELLISAdam8bit, not 'Adam'"):
         _settings(optimizer="Adam")
     with pytest.raises(ValueError, match="optimizer must be one of"):  # no dataset is read to get here
         _settings(optimizer="Adam", dataset_config="config/datasets/does_not_exist.yaml")
@@ -504,7 +504,7 @@ def test_optim_config_lr_must_be_positive() -> None:
     """
 
     for lr in (0.0, -1e-4):
-        with pytest.raises(ValueError, match="optim_config.lr must be positive"):
+        with pytest.raises(ValueError, match="optim_config.lr must be (positive|non-negative)"):
             _settings(optim_config=OptimizerConfig(lr=lr))
     assert _settings(optim_config=OptimizerConfig(lr=1e-4)).optim_config.lr == 1e-4
 
@@ -551,3 +551,145 @@ def test_packing_from_yaml_and_cli(tmp_path: Path) -> None:
     assert cfg.micro_batches_per_rank(1) == 4 and cfg.tokens_per_optimizer_step == 2048
     overridden = parse_settings(["--config", str(yaml_path), "--micro_batches_per_step", "8"])
     assert overridden.micro_batches_per_rank(1) == 8
+
+
+@pytest.mark.parametrize("log_interval,gradient_interval", [(1, 0), (4, 0), (1, 1), (1, 8), (4, 4), (4, 12)])
+def test_gradient_metrics_interval_validation(log_interval: int, gradient_interval: int) -> None:
+    settings = _settings(log_step_interval=log_interval, eval_step_interval=log_interval * 4,
+                         log_gradient_metrics_interval=gradient_interval)
+    assert settings.log_gradient_metrics_interval == gradient_interval
+    assert "log_gradient_metrics" not in asdict(settings)
+
+
+@pytest.mark.parametrize("interval", [-1, 1.5, 2.0, True, False, "8"])
+def test_gradient_metrics_interval_rejects_invalid_values(interval: object) -> None:
+    with pytest.raises(ValueError, match="log_gradient_metrics_interval"):
+        _settings(log_gradient_metrics_interval=interval)
+
+
+@pytest.mark.parametrize("interval", [1, 2, 6])
+def test_gradient_metrics_interval_must_align_with_basic_logs(interval: int) -> None:
+    with pytest.raises(ValueError, match=rf"log_gradient_metrics_interval \({interval}\) must be a multiple of log_step_interval \(4\)"):
+        _settings(log_step_interval=4, eval_step_interval=8, log_gradient_metrics_interval=interval)
+
+
+@pytest.mark.parametrize("interval", [0, 8])
+def test_gradient_metrics_interval_cli_override(interval: int) -> None:
+    settings = parse_settings(["--config", str(TINY_YAML), "--log_gradient_metrics_interval", str(interval)])
+    assert settings.log_step_interval == 1 and settings.log_gradient_metrics_interval == interval
+
+
+def test_old_gradient_metrics_flag_is_rejected() -> None:
+    with pytest.raises(SystemExit):
+        parse_settings(["--config", str(TINY_YAML), "--log_gradient_metrics", "true"])
+
+
+@pytest.mark.parametrize(('value', 'expected'), [
+    (None, ''), ('', ''), ('  ,  ', ''), ('adapter', 'adapter'), ('attention', 'attention'), ('mlp', 'mlp'),
+    ('mlp, adapter,adapter', 'adapter,mlp'), (' ATTENTION, adapter, MLP ', 'adapter,attention,mlp'),
+])
+def test_correlation_selector_normalization(value: str | None, expected: str) -> None:
+    assert _settings(log_correlations=value).log_correlations == expected
+    assert _settings().log_correlations == ''
+
+
+@pytest.mark.parametrize('value', [True, False, 1, ['adapter'], 'true', 'all', 'adapter,attn', 'mlp,typo'])
+def test_correlation_selector_rejects_invalid_values(value: object) -> None:
+    with pytest.raises(ValueError, match='log_correlations'):
+        _settings(log_correlations=value)
+
+
+def test_correlation_selector_yaml_and_cli(tmp_path: Path) -> None:
+    values = yaml.safe_load(TINY_YAML.read_text())
+    values['log_correlations'] = 'mlp,adapter'
+    path = tmp_path/'correlations.yaml'
+    path.write_text(yaml.safe_dump(values))
+    assert parse_settings(['--config', str(path)]).log_correlations == 'adapter,mlp'
+    assert parse_settings(['--config', str(path), '--log_correlations', 'attention,mlp']).log_correlations == 'attention,mlp'
+    assert parse_settings(['--config', str(path), '--log_correlations', '']).log_correlations == ''
+    values['log_correlations'] = None
+    path.write_text(yaml.safe_dump(values))
+    assert parse_settings(['--config', str(path)]).log_correlations == ''
+
+
+def test_gradient_metrics_interval_yaml_validation(tmp_path: Path) -> None:
+    values = yaml.safe_load(TINY_YAML.read_text())
+    values.update(log_step_interval=2, log_gradient_metrics_interval=3)
+    path = tmp_path / "misaligned.yaml"
+    path.write_text(yaml.safe_dump(values))
+    with pytest.raises(ValueError, match="log_gradient_metrics_interval.*must be a multiple"):
+        parse_settings(["--config", str(path)])
+
+
+def test_sample_cache_default_and_legacy_override() -> None:
+    assert _settings().sample_use_cache
+    assert not _settings(sample_use_cache=False).sample_use_cache
+
+
+@pytest.mark.parametrize('path', SHIPPED_RUN_CONFIGS)
+def test_custom_kernels_default_and_cli_override(path: Path) -> None:
+    assert parse_settings(['--config', str(path)]).use_custom_kernels is True
+    assert parse_settings(['--config', str(path), '--use_custom_kernels', 'false']).use_custom_kernels is False
+
+
+@pytest.mark.parametrize(("key", "value"), [
+    ("betas", ()), ("betas", (0.9,)), ("betas", (0.9, 0.95, 0.99)), ("betas", "ab"),
+    ("betas", (True, 0.95)), ("betas", (0.9, "0.95")),
+    *[("betas", (bad, 0.95)) for bad in (-0.1, 1.0, float("nan"), float("inf"))],
+    *[("betas", (0.9, bad)) for bad in (-0.1, 1.0, float("nan"), float("inf"))],
+    *[(key, bad) for key in ("lr", "eps", "weight_decay")
+      for bad in (-1.0, float("nan"), float("inf"), True, "0.1")],
+])
+def test_optimizer_config_rejects_invalid_scalars(key: str, value: Any) -> None:
+    with pytest.raises(ValueError, match=key):
+        OptimizerConfig(**{key: value})
+
+
+@pytest.mark.parametrize("optimizer", ["ELLISAdam", "ELLISAdam8bit"])
+def test_ellis_reference_lr_is_positive_but_adamw_can_start_at_zero(optimizer: str) -> None:
+    with pytest.raises(ValueError, match="optim_config.lr must be positive"):
+        _settings(optimizer=optimizer, optim_config=OptimizerConfig(lr=0.0))
+    cfg = OptimizerConfig(lr=0.0, betas=(0.0, 0.0), eps=0.0, weight_decay=0.0)
+    assert _settings(optimizer="AdamW", optim_config=cfg).optim_config is cfg
+    assert OptimizerConfig().eps is None
+
+
+@pytest.mark.parametrize("optimizer", ["AdamW", "ELLISAdam", "ELLISAdam8bit"])
+def test_settings_revalidate_mutated_optimizer_config_before_dataset_access(optimizer: str) -> None:
+    cfg = OptimizerConfig()
+    cfg.betas = (0.9, 1.0)
+    with pytest.raises(ValueError, match="optim_config.betas"):
+        _settings(optimizer=optimizer, optim_config=cfg, dataset_config="does-not-exist.yaml")
+
+
+def test_yaml_invalid_optimizer_fails_before_nonexistent_dataset_or_model(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "bad.yaml"
+    path.write_text(TINY_YAML.read_text().replace("betas: [0.9, 0.95]", "betas: [0.9, 1.0]"))
+    with pytest.raises((ValueError, SystemExit)) as error:
+        parse_settings(["--config", str(path), "--dataset_config", "missing-data.yaml",
+                        "--model_architecture_config", "missing-model.yaml"])
+    assert "betas" in str(error.value) + capsys.readouterr().err
+
+
+def test_sample_batch_size_defaults_and_changes() -> None:
+    assert _settings().sample_batch_size == 8
+    assert _settings(sample_batch_size=1).sample_batch_size == 1
+
+
+@pytest.mark.parametrize("value", [0.0, 0.7, [0.0, 0.7], [0.0]])
+def test_sample_temperature_scalar_and_list_round_trip(tmp_path: Path, value: Any) -> None:
+    path = tmp_path / "temperatures.yaml"
+    config = yaml.safe_load(TINY_YAML.read_text())
+    config["sample_temperature"] = value
+    path.write_text(yaml.safe_dump(config))
+    parsed = parse_settings(["--config", str(path)])
+    assert parsed.sample_temperature == value
+    assert asdict(parsed)["sample_temperature"] == value
+
+
+@pytest.mark.parametrize("value", [[], [-0.1], [0.0, -0.1], float("nan"), float("inf"), [float("inf")], True, [True], ["0.7"]])
+def test_sample_temperature_rejects_invalid_values(value: Any) -> None:
+    with pytest.raises(ValueError, match="sample_temperature"):
+        _settings(sample_temperature=value)

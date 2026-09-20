@@ -28,7 +28,8 @@ import yaml
 from data_preparation.lib.build.runner import prepare
 from training.backend.single_device import SingleDeviceBackend
 from training.checkpoint import checkpoint_dir, find_latest_checkpoint
-from training.run import run_directory_of, train
+from training.execution import get_run_directory
+from training.run import train
 from training.settings import Settings, parse_settings
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -43,12 +44,13 @@ GOLDEN_ALWAYS_EXACT_KEYS = ("lr", "checkpoints", "optimizer_steps")
 
 def write_tiny_yaml(tmp_path: Path, tiny_dataset_dir: Path, out_dir: Path, **overrides: Any) -> Path:
     """
-    `config/tiny.yaml` with `dataset_dir` / `out_dir` rewritten and `overrides` set as plain values (a key the
+    `config/tiny.yaml` with native execution for portable tests, `dataset_dir` / `out_dir` rewritten, and `overrides`
+    set as plain values (a key the
     file does not have is added at the end); returns the path of the written yaml (`tmp_path / tiny.yaml`).
     """
 
     settings: dict[str, Any] = yaml.safe_load(TINY_YAML.read_text())
-    settings.update({"out_dir": str(out_dir), "dataset_dir": str(tiny_dataset_dir), **overrides})
+    settings.update({"out_dir": str(out_dir), "dataset_dir": str(tiny_dataset_dir), "use_custom_kernels": False, **overrides})
     path = tmp_path / "tiny.yaml"
     path.write_text(yaml.safe_dump(settings, sort_keys=False))
     return path
@@ -127,7 +129,7 @@ def run_reference(tmp_path: Path, tiny_dataset_dir: Path) -> ReferenceRun:
     The 20-step tiny run in fp32 on the CPU (one thread, deterministic algorithms): the golden configuration.
 
     `config/tiny.yaml` (packs of 512 tokens, two per step) with `precision: "32"`, `wandb_enabled: false`,
-    `export_to_hf: false`, `resume: false` and `out_dir` under `tmp_path`, through
+    `use_custom_kernels: false`, `export_to_hf: false`, `resume: false` and `out_dir` under `tmp_path`, through
     `train(settings, backend=SingleDeviceBackend(device="cpu", precision="32"), keep_history=True)`. The yaml is
     written to `tmp_path`. Nothing is probed inside the run.
     """
@@ -139,7 +141,7 @@ def run_reference(tmp_path: Path, tiny_dataset_dir: Path) -> ReferenceRun:
         )
         settings = parse_settings(["--config", str(yaml_path)])
         report = train(settings, backend=SingleDeviceBackend(device="cpu", precision="32"), keep_history=True)
-    return ReferenceRun(report.history, yaml_path, run_directory_of(settings))
+    return ReferenceRun(report.history, yaml_path, get_run_directory(settings))
 
 
 def reference_metrics(reference: ReferenceRun) -> dict[str, Any]:
@@ -160,6 +162,7 @@ def reference_metrics(reference: ReferenceRun) -> dict[str, Any]:
     assert final_checkpoint is not None
     final_state = torch.load(final_checkpoint, map_location="cpu", weights_only=False)
     return {
+        "loss_normalization": settings.loss_normalization,
         "steps": steps,
         "checkpoints": sorted(p.name for p in checkpoint_dir(reference.run_directory).glob("*.pth")),
         "optimizer_steps": optimizer_steps_taken(final_state["optimizer"]),

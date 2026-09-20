@@ -19,7 +19,7 @@ import pytest
 import torch
 from rich.console import Console
 
-from data_preparation.dataset_config import DatasetConfig
+from data_preparation import DatasetConfig
 from evaluation.samples import GeneratedSample
 from model import RecurrentGPT
 from training.backend.single_device import SingleDeviceBackend
@@ -44,7 +44,7 @@ from training.optim import ELLISAdam, get_param_groups
 from training.settings import Settings
 from training.stage_manager import StageManager
 from training.testing.stages import resolved_stage
-from training.step import StepResult, TrainingProgress
+from training.steps import StepResult, TrainingProgress
 from training.test_step import PACK_LENGTH, reference_settings, reference_stage_manager
 from training.ui.board import TrainingDashboard
 from training.ui.capture import WANDB_QUIET_SETTINGS
@@ -404,6 +404,7 @@ class RecordingDashboard:
         self.events: list[str] = []
         self.statuses: list[str] = []
         self.discounted: list[float] = []  # the seconds of every block that was not a training step
+        self.micro_batches: list[tuple[int, int]] = []  # (completed, total) of every micro-batch report
 
     def update_step(
         self, step: int, stage_index: int, transition: float | None, metrics: Mapping[str, object]
@@ -421,6 +422,9 @@ class RecordingDashboard:
 
     def discount_time(self, seconds: float) -> None:
         self.discounted.append(seconds)
+
+    def update_micro_batch(self, completed: int, total: int) -> None:
+        self.micro_batches.append((completed, total))
 
 
 def string_console_dashboard(stage_manager: StageManager, log_step_interval: int = 1) -> TrainingDashboard:
@@ -508,6 +512,35 @@ def _record_wandb_logs(monkeypatch: pytest.MonkeyPatch) -> dict[int, dict[str, A
     return recorded
 
 
+def test_recurrence_metrics_reach_wandb_history_and_dashboard_without_filling_gaps(
+    tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded = _record_wandb_logs(monkeypatch)
+    settings = reference_settings(log_step_interval=1, log_gradient_metrics_interval=2)
+    stage_manager = reference_stage_manager(settings)
+    clock = FakeClock()
+    run_logger = open_run_logger(settings, stage_manager, tiny_model, resolved, tmp_path, clock)
+    probes = {'token_correlation': torch.tensor(.5), 'token_dispersion': torch.tensor(.125),
+              'state_sensitivity': torch.tensor(.25), 'recurrence/core_0/state_sensitivity': torch.tensor(.75),
+              'representation/pre_head/correlation_pairs': torch.tensor(120),
+              'adapter/core_0/iter_3/state_input/correlation': torch.tensor(.1),
+              'adapter/core_0/iter_3/merged_output/correlation': torch.tensor(.8),
+              'adapter/core_2/iter_8/core_output/correlation': torch.tensor(.9),
+              'attention/core_1/iter_2/layer_3/input/correlation': torch.tensor(.4),
+              'mlp/core_2/iter_8/layer_4/output/correlation': torch.tensor(.6)}
+    progress = TrainingProgress(step=1)
+    result = fake_result(stage_manager, 1, metrics=probes)
+    progress.advance()
+    run_logger.log_step(result, progress)
+    for key, value in probes.items():
+        assert recorded[2][key] == value.item() == run_logger.history[2][key]
+        assert recording(run_logger).steps[-1][3][key] == value.item()
+    result = fake_result(stage_manager, 2)
+    progress.advance()
+    run_logger.log_step(result, progress)
+    assert not set(probes) & recorded[3].keys()
+
+
 def test_open_logs_the_run_header_and_ends_the_setup_timer(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, console_records: pytest.LogCaptureFixture
 ) -> None:
@@ -559,13 +592,15 @@ def test_log_step_history_wandb_dict_and_throughput(
 
     assert sorted(run_logger.history) == [1, 2, 3]
     for done, metrics in run_logger.history.items():
-        assert set(metrics) == STEP_KEYS | {"l2_param_norm", "data_composition/source_a"}
+        expected_keys = STEP_KEYS if done > 2 else STEP_KEYS - {"remaining_time"}
+        assert set(metrics) == expected_keys | {"l2_param_norm", "data_composition/source_a"}
         assert all(isinstance(value, float) for value in metrics.values())
         assert metrics["step"] == done and metrics["loss"] == 2.0 and metrics["ppl"] == pytest.approx(math.exp(2.0))
         assert metrics["lr"] == 1e-4 * (done - 1) and metrics["grad_norm"] == 0.5 and metrics["l2_param_norm"] == 7.0
         assert metrics["seconds/step"] == 2.0 and metrics["tokens/second"] == TOKENS_PER_STEP / 2.0
         assert metrics["total_tokens"] == done * TOKENS_PER_STEP and metrics["total_time"] == 2.0 * done
-        assert metrics["remaining_time"] == 2.0 * (10 - done)
+        if done > 2:
+            assert metrics["remaining_time"] == 2.0 * (10 - done)
         assert (metrics["stage/current_stage"], metrics["stage/in_transition"], metrics["stage/base_lr"]) == (0, 0, 3e-4)
         assert metrics["data_composition/source_a"] == 1.0
         assert recorded[done] == metrics and not any(torch.is_tensor(v) for v in recorded[done].values())
@@ -611,7 +646,7 @@ def test_log_interval_composition_fractions_sum_to_one_and_reset(
     """
 
     recorded = _record_wandb_logs(monkeypatch)
-    settings = reference_settings(log_step_interval=2)
+    settings = reference_settings(log_step_interval=2, log_gradient_metrics_interval=2)
     stage_manager = reference_stage_manager(settings)
     clock = FakeClock()
     run_logger = open_run_logger(settings, stage_manager, tiny_model, resolved, tmp_path, clock)
@@ -628,7 +663,7 @@ def test_log_interval_composition_fractions_sum_to_one_and_reset(
         clock.advance(1.0)
         run_logger.log_step(result, progress)
     assert sorted(run_logger.history) == [2, 4] and sorted(recorded) == [2, 4]
-    final_logger = open_run_logger(reference_settings(log_step_interval=3, eval_step_interval=3), stage_manager, tiny_model, resolved, tmp_path, clock)
+    final_logger = open_run_logger(reference_settings(log_step_interval=3, log_gradient_metrics_interval=3, eval_step_interval=3), stage_manager, tiny_model, resolved, tmp_path, clock)
     final_progress = TrainingProgress()
     while final_progress.step < stage_manager.total_steps:
         result = fake_result(stage_manager, final_progress.step, data_ids=["a"] * 4)
@@ -721,6 +756,43 @@ def test_evaluating_times_the_validation_and_log_step_reports_it(
     assert all(isinstance(v, float) for v in report.last_validation.values())
 
 
+@pytest.mark.parametrize("start_step", [0, 4])
+def test_eta_excludes_first_actual_update_and_smooths_after_start_or_resume(
+    tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path, start_step: int
+) -> None:
+    settings = reference_settings()
+    stage_manager = reference_stage_manager(settings)
+    clock = FakeClock()
+    logger = open_run_logger(settings, stage_manager, tiny_model, resolved, tmp_path, clock, start_step=start_step)
+    progress = TrainingProgress(step=start_step)
+    warmup = 2 if start_step == 0 else 1
+    run_fake_steps(logger, stage_manager, progress, clock, warmup, 100)
+    assert all("remaining_time" not in row for row in logger.history.values())
+    run_fake_steps(logger, stage_manager, progress, clock, 1, 2)
+    assert logger.history[progress.step]["remaining_time"] == 2 * (stage_manager.total_steps - progress.step)
+    run_fake_steps(logger, stage_manager, progress, clock, 1, 4)
+    metrics = logger.history[progress.step]
+    assert metrics["remaining_time"] == pytest.approx(2.2 * (stage_manager.total_steps - progress.step))
+    assert metrics["total_time"] == warmup * 100 + 6
+    assert metrics["seconds/step"] == 4  # raw rates still describe the actual latest interval
+
+
+def test_eta_samples_each_step_even_when_logging_less_often(
+    tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path
+) -> None:
+    settings = reference_settings()
+    settings.log_step_interval = 5
+    stage_manager = reference_stage_manager(settings)
+    clock = FakeClock()
+    logger = open_run_logger(settings, stage_manager, tiny_model, resolved, tmp_path, clock)
+    progress = TrainingProgress()
+    for seconds in (100, 200, 2, 4, 4):
+        run_fake_steps(logger, stage_manager, progress, clock, 1, seconds)
+    assert list(logger.history) == [5]
+    assert logger.history[5]["remaining_time"] == pytest.approx(2.38 * (stage_manager.total_steps - 5))
+    assert logger.history[5]["total_time"] == 310
+
+
 def test_side_blocks_are_kept_out_of_the_throughput_metrics(
     tiny_model: RecurrentGPT, resolved: ResolvedDataset, tmp_path: Path
 ) -> None:
@@ -743,7 +815,7 @@ def test_side_blocks_are_kept_out_of_the_throughput_metrics(
     run_fake_steps(run_logger, stage_manager, progress, clock, 1, 0.5)
     assert run_logger.history[2]["seconds/step"] == 0.5
     assert run_logger.history[2]["tokens/second"] == TOKENS_PER_STEP / 0.5
-    assert run_logger.history[2]["remaining_time"] == 0.5 * (stage_manager.total_steps - 2)
+    assert "remaining_time" not in run_logger.history[2]
     assert run_logger.history[2]["total_time"] == 31.0, "total_time is the wall time since `open`, evaluation included"
 
     with run_logger.saving_checkpoint():
@@ -752,7 +824,11 @@ def test_side_blocks_are_kept_out_of_the_throughput_metrics(
         clock.advance(4.0)
     run_fake_steps(run_logger, stage_manager, progress, clock, 1, 0.5)
     assert run_logger.history[3]["seconds/step"] == 0.5, "a checkpoint and a sampling block are not training either"
+    assert run_logger.history[3]["remaining_time"] == 0.5 * (stage_manager.total_steps - 3)
     assert recording(run_logger).discounted == [30.0, 20.0, 4.0]
+    run_logger.note_micro_batch(1, 4)
+    run_logger.note_micro_batch(4, 4)
+    assert recording(run_logger).micro_batches == [(1, 4), (4, 4)], "handed to the dashboard as they are"
 
 
 def test_data_wait_metrics_and_the_rate_limited_warning(
@@ -785,6 +861,9 @@ def test_data_wait_metrics_and_the_rate_limited_warning(
     assert len(warnings) == 1 and getattr(warnings[0], "keep", False) is True
     assert "waited 0.2s for training data over the last 1 step(s), 20% of the training time" in warnings[0].getMessage()
     assert "(slowest: a 0.1s, b 0.1s)" in warnings[0].getMessage()  # per-source seconds, largest first
+    assert "loader waiting (worker start-ups are not counted); possible causes include storage" in warnings[0].getMessage()
+    assert "decompression, tokenization, collation, worker scheduling and inter-process transfer" in warnings[0].getMessage()
+    assert "tokenization is the bottleneck" not in warnings[0].getMessage()
     assert recording(run_logger).events[-1] == "waiting for training data: 20% of the training time (a 0.1s, b 0.1s)"
 
     step(1.0, {"a": 0.5})  # still above the threshold, but inside the quiet interval: no second warning
@@ -1135,7 +1214,7 @@ def test_open_picks_the_console_fallback_under_pytest_and_writes_train_log(
     """
 
     monkeypatch.setenv("TRAINING_DASHBOARD", "1")
-    settings = reference_settings(log_step_interval=2)
+    settings = reference_settings(log_step_interval=2, log_gradient_metrics_interval=2)
     stage_manager = two_stage_manager(settings)
     progress = TrainingProgress(step=4, resume_step=4)
     backend = SingleDeviceBackend(device="cpu", precision="32")
@@ -1168,7 +1247,7 @@ def test_open_dashboard_arguments(tmp_path: Path) -> None:
     details, the log interval and the resume step; the fallback is chosen when the display is disabled.
     """
 
-    settings = reference_settings(log_step_interval=3, eval_step_interval=99)  # eval must be a multiple of log
+    settings = reference_settings(log_step_interval=3, log_gradient_metrics_interval=3, eval_step_interval=99)  # eval must be a multiple of log
     stage_manager = two_stage_manager(settings)
     with open_dashboard(settings, tmp_path, stage_manager, start_step=5, device="cuda:0") as board:
         assert isinstance(board, ConsoleFallbackDashboard)  # stdout is not a TTY under pytest
@@ -1195,7 +1274,7 @@ def test_open_dashboard_builds_the_live_display_when_enabled(tmp_path: Path, mon
     """
 
     monkeypatch.setattr("training.logger.dashboard_enabled", lambda: True)
-    settings = reference_settings(log_step_interval=3, eval_step_interval=99)
+    settings = reference_settings(log_step_interval=3, log_gradient_metrics_interval=3, eval_step_interval=99)
     stage_manager = two_stage_manager(settings)
     with open_dashboard(settings, tmp_path, stage_manager, start_step=5, device="cpu") as board:
         assert isinstance(board, TrainingDashboard) and _display_is_up(board) and board.enabled

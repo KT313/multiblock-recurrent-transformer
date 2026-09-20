@@ -32,7 +32,9 @@ from training.checkpoint import checkpoint_dir
 from training.testing.golden import write_tiny_yaml
 from training.logger import TrainingReport
 from training.settings import Settings
-from training.train import StopRequest, main, stop_on_interrupt
+from training.failure import FatalHandler, exit_failed_worker
+from training.cli import StopRequest, configure_console_logging, get_launch_rank, stop_on_interrupt
+from training.train import main
 from training.ui.common import TRAIN_LOG_NAME, TRAINING_LOGGER_NAME
 from training.ui.testing import BOX_CHARACTERS
 from ui.testing import screen_of, strip_ansi
@@ -99,8 +101,10 @@ class FakeTrain:
         backend: Backend | None = None,
         should_stop: StopRequest | None = None,
         started_at: float | None = None,
+        on_fatal_error: FatalHandler | None = None,
     ) -> TrainingReport:
-        self.calls.append({"settings": settings, "backend": backend, "should_stop": should_stop, "started_at": started_at})
+        self.calls.append({"settings": settings, "backend": backend, "should_stop": should_stop,
+                           "started_at": started_at, "on_fatal_error": on_fatal_error})
         if self.error is not None:
             raise self.error
         assert self.report is not None
@@ -182,6 +186,22 @@ def test_main_without_a_config_exits_through_the_parser(capsys: pytest.CaptureFi
         main([])
     assert excinfo.value.code == 2
     assert "dataset_config" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('backend,supervised', [('single_device', False), ('single_device', True),
+                                              ('ddp', False), ('ddp', True)])
+def test_fatal_policy_is_only_selected_for_supervised_ddp_cli(
+    monkeypatch: pytest.MonkeyPatch, yaml_path: Path, tmp_path: Path, backend: str, supervised: bool,
+) -> None:
+    if supervised:
+        monkeypatch.setenv('TORCHELASTIC_RUN_ID', 'fixture')
+    else:
+        monkeypatch.delenv('TORCHELASTIC_RUN_ID', raising=False)
+    fake = FakeTrain(_report(tmp_path / 'out'))
+    monkeypatch.setattr(train_module, 'train', fake)
+    assert main(['--config', str(yaml_path), '--backend', backend]) == 0
+    expected = exit_failed_worker if supervised and backend == 'ddp' else None
+    assert fake.calls[0]['on_fatal_error'] is expected
 
 
 # --- the stop request --------------------------------------------------------------------------------------------------
@@ -299,8 +319,8 @@ def test_configure_console_logging_routes_training_and_data_preparation_records_
     terminal in the line format of the data-prep CLI (the resolver itself configures nothing).
     """
 
-    training_logger = train_module.configure_console_logging()
-    train_module.configure_console_logging()
+    training_logger = configure_console_logging()
+    configure_console_logging()
     assert training_logger is detached_training_handlers and training_logger.level == logging.INFO
     for configured in (training_logger, detached_data_preparation_handlers):
         handlers = [h for h in configured.handlers if isinstance(h, ProgressStreamHandler)]
@@ -322,7 +342,7 @@ def test_a_non_main_rank_logs_warnings_only_with_a_rank_prefix(
     so the main rank tells the story of the run and a failing rank is still heard.
     """
 
-    training_logger = train_module.configure_console_logging(rank=3)
+    training_logger = configure_console_logging(rank=3)
     assert training_logger.level == logging.WARNING and detached_data_preparation_handlers.level == logging.WARNING
     logging.getLogger("training.logger").info("Total training steps: 20 (2 micro-batches each)")
     logging.getLogger("data_preparation.training.data.dataset_resolver").info("source a: 40 processed rows, all training")
@@ -333,7 +353,7 @@ def test_a_non_main_rank_logs_warnings_only_with_a_rank_prefix(
     assert lines[0].startswith("[rank 3] ") and lines[0].endswith("WARNING training.run: the loader workers do not keep up")
     assert lines[1].startswith("[rank 3] ") and lines[1].endswith("ERROR data_preparation.lib.build.runner: shard broken")
     # back on the main rank: INFO again, no prefix (the same handlers, reconfigured)
-    train_module.configure_console_logging(rank=0)
+    configure_console_logging(rank=0)
     logging.getLogger("training.logger").info("resumed")
     line = capsys.readouterr().err.rstrip().splitlines()[-1]
     assert not line.startswith("[rank") and line.endswith("INFO training.logger: resumed")
@@ -351,9 +371,9 @@ def test_main_on_a_non_main_rank_prints_no_summary(
     monkeypatch.setattr(train_module, "train", fake_train)
     assert main(["--config", str(yaml_path)]) == 0
     assert len(fake_train.calls) == 1 and capsys.readouterr().out == ""
-    assert train_module.launch_rank() == 1
+    assert get_launch_rank() == 1
     monkeypatch.delenv("RANK")
-    assert train_module.launch_rank() == 0
+    assert get_launch_rank() == 0
 
 
 # --- end to end in a pseudo-terminal: the live dashboard ---------------------------------------------------------------
@@ -408,7 +428,8 @@ def _tiny_cli_arguments(tiny_dataset_dir: Path, out_dir: Path, *overrides: str) 
     `config/tiny.yaml` on the prepared tiny dataset, fp32 (bf16 autocast is slow on the CPU), no wandb.
     """
 
-    return ["--config", "config/tiny.yaml", "--dataset_dir", str(tiny_dataset_dir), "--out_dir", str(out_dir), "--precision", "32", *overrides]
+    return ["--config", "config/tiny.yaml", "--dataset_dir", str(tiny_dataset_dir), "--out_dir", str(out_dir),
+            "--precision", "32", "--use_custom_kernels", "false", *overrides]
 
 
 def _assert_clean_terminal(text: str, width: int) -> str:

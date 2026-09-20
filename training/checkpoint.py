@@ -3,13 +3,17 @@
 Checkpoint schema, naming, search, and save/load through the backend. Steps in file names are OPTIMIZER steps.
 
 A checkpoint is one `torch.save` dict: the `"model"` and `"optimizer"` state dicts plus the `CheckpointMetadata`
-fields. Older layouts have no loader (clean break): `CheckpointMetadata.from_state` raises on a missing key.
+fields. Older layouts have no loader (clean break): `CheckpointMetadata.from_state` raises on a missing key. The one
+exception is the layout right before the multi-rank fields (`LEGACY_RNG_KEY`, one `rng` dict in place of `world_size`
+and `rng_states`): it is read as a one-rank checkpoint, since every other field is the same, so a run started before
+the multi-GPU support resumes; the resumed run writes the current layout.
 
 Per-rank state: the RNG state is stored for every rank (`rng_states`, indexed by rank, gathered through the
 backend), the data stream once (rank 0 reads and packs for the whole world). A resume needs the same `world_size`
 the checkpoint was written with (`training.run.restore_checkpoint_if_resuming`).
 """
 
+import logging
 import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, fields
@@ -21,11 +25,15 @@ from torch.nn import Module
 from torch.optim import Optimizer
 
 from training.backend.base import Backend
+from training.optim.sharding import sharded_optimizer
 from training.settings import Settings
 from training.stage_manager import StageManager
 
+log = logging.getLogger(__name__)
+
 CHECKPOINT_SUBDIR = "checkpoints"
 CHECKPOINT_SUFFIX = ".pth"
+LEGACY_RNG_KEY = "rng"  # the single-rank layout before `world_size` / `rng_states`: one `Backend.rng_state()` dict
 
 
 @dataclass
@@ -43,7 +51,10 @@ class CheckpointMetadata:
     dataset_config_hash: str  # `ResolvedDataset.config_hash`
     validation_rows: dict[str, int]  # `ResolvedDataset.validation_rows`, {source: rows held out for validation}
     source_rows: dict[str, int]  # `ResolvedDataset.source_rows`, {source: processed rows}; a resume refuses a changed count
-    data_stream: dict[str, Any]  # `training.step.BatchStream.state_dict()`: rows read, loaded / target slots, buffers, pool
+    data_stream: dict[str, Any]  # `training.steps.BatchStream.state_dict()`: rows read, loaded / target slots, buffers, pool
+
+    dataset_build_id: str | None = None  # unknown provenance in legacy checkpoints
+    tokenizer_contract: dict[str, Any] | None = None
 
     def to_state(self) -> dict[str, Any]:
         """
@@ -55,9 +66,14 @@ class CheckpointMetadata:
     @classmethod
     def from_state(cls, state: Mapping[str, Any]) -> "CheckpointMetadata":
         """
-        Read the metadata fields out of a loaded checkpoint dict; other keys (the state dicts) are ignored.
+        Read the metadata fields out of a loaded checkpoint dict; other keys (the state dicts) are ignored. A
+        checkpoint of the single-rank layout (`LEGACY_RNG_KEY` instead of `world_size` and `rng_states`) is read as
+        written by one rank.
         """
 
+        if LEGACY_RNG_KEY in state and "world_size" not in state and "rng_states" not in state:
+            state = {**state, "world_size": 1, "rng_states": [state[LEGACY_RNG_KEY]]}
+        state = {"dataset_build_id": None, "tokenizer_contract": None, **state}
         missing = [field.name for field in fields(cls) if field.name not in state]
         if missing:
             raise KeyError(
@@ -153,7 +169,8 @@ SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME = (
     "prepare_max_parallel_downloads",
     # logging cadence: log steps read out metrics, they draw no RNG and change no state
     "log_step_interval",
-    "log_gradient_metrics",
+    "log_gradient_metrics_interval",
+    "log_correlations",  # isolated diagnostic selection; does not change training RNG, gradients or parameters
     # validation cadence and width: `evaluate` runs under `torch.random.fork_rng` (training/evaluation.py), so how
     # often and how much validation runs leaves the training stream untouched; only the reported numbers change
     "eval_step_interval",
@@ -171,14 +188,17 @@ SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME = (
     # samples and benchmarks: RNG-isolated inference, files next to the checkpoints
     "sample_step_interval",
     "sample_at_training_progress",
+    "sample_batch_size",
     "sample_max_new_tokens",
     "sample_temperature",
+    "sample_use_cache",
     "sample_recurrences",
     "benchmark_step_interval",
     "benchmark_at_training_progress",
     "benchmark_tasks",
     "benchmark_limit",
     "benchmark_num_fewshot",
+    "benchmark_apply_chat_template",
     "benchmark_batch_size",
     "benchmark_recurrences",
 )
@@ -200,11 +220,18 @@ def check_settings_unchanged(
     """
 
     current = asdict(settings)
+    # Checkpoints predating kernel integration always used native operations. Treat an absent flag as false,
+    # while keeping changes subject to the same resume policy as precision and compilation.
+    stored_settings = {
+        "use_custom_kernels": False, "loss_normalization": "legacy_pack_v0", "optimizer_sharding": "none"
+    } | metadata.settings
+    # Pre-scaling checkpoints used unit-gain sandwich branches; only that default is implicit on resume.
+    stored_model_config = {"use_custom_kernels": False, "residual_scaling": "none"} | metadata.model_config
     compared = [key for key in current if key not in SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME]
     details = {
-        key: f"checkpoint {metadata.settings[key]!r} != current {current[key]!r}"
+        key: f"checkpoint {stored_settings[key]!r} != current {current[key]!r}"
         for key in compared
-        if key in metadata.settings and metadata.settings[key] != current[key]
+        if key in stored_settings and stored_settings[key] != current[key]
     }
     if PARAM_GROUPING_SETTING in details:
         raise ValueError(
@@ -215,21 +242,29 @@ def check_settings_unchanged(
     details |= {
         key: "not stored in the checkpoint (written by an older version of the training code)"
         for key in compared
-        if key not in metadata.settings
+        if key not in stored_settings
     }
-    if model_config != metadata.model_config:
+    if model_config != stored_model_config:
         differing = sorted(
             key
-            for key in model_config.keys() | metadata.model_config.keys()
-            if model_config.get(key) != metadata.model_config.get(key)
+            for key in model_config.keys() | stored_model_config.keys()
+            if model_config.get(key) != stored_model_config.get(key)
         )
         details["model_config"] = f"differs from the stored model config in {differing}"
+    if "loss_normalization" in details:
+        details["loss_normalization"] += (
+            "; this changes the training objective and validation metric; continuation preserves optimizer moments "
+            "and data/RNG state but differs from the legacy trajectory"
+        )
     if details and not allow_settings_change:
         listed = "; ".join(f"{key}: {details[key]}" for key in sorted(details))
         raise ValueError(
             f"resuming with changed {sorted(details)}: {listed}; set allow_settings_change: true to continue "
             "anyway (the run becomes a mix of two configurations)"
         )
+
+    if "loss_normalization" in details and allow_settings_change:
+        log.warning("Acknowledged loss normalization transition: %s", details["loss_normalization"])
 
 
 
@@ -264,7 +299,8 @@ def save_training_checkpoint(
 
 
 def load_training_checkpoint(
-    backend: Backend, path: str | Path, model: Module, optimizer: Optimizer
+    backend: Backend, path: str | Path, model: Module, optimizer: Optimizer,
+    *, tokenizer_contract: dict[str, Any] | None = None,
 ) -> CheckpointMetadata:
     """
     Load the model and optimizer state in place and return the checkpoint's metadata.
@@ -275,6 +311,22 @@ def load_training_checkpoint(
 
     state = backend.load_checkpoint(path)
     metadata = CheckpointMetadata.from_state(state)
+    from training.tokenizer_contract import check_checkpoint_tokenizer
+
+    check_checkpoint_tokenizer(metadata.tokenizer_contract, tokenizer_contract)
+    sharded = sharded_optimizer(optimizer)
+    mode = "zero1" if sharded is not None else "none"
+    if metadata.settings.get("optimizer_sharding", "none") != mode:
+        raise ValueError("changing optimizer_sharding on resume is unsupported; start a fresh run")
+    if sharded is not None:
+        if metadata.world_size != backend.world_size:
+            raise ValueError("zero1 resume requires the same number of ranks as the checkpoint")
+        sharded.validate_state_dict(state["optimizer"])
+        loaded_groups = [
+            {key: _plain(value) for key, value in group.items() if key not in UNCOMPARED_GROUP_KEYS}
+            for group in state["optimizer"]["param_groups"]
+        ]
+        check_param_groups_unchanged(_group_hyperparameters(optimizer), loaded_groups)
     backend.plain_model(model).load_state_dict(state["model"])
     expected = _group_hyperparameters(optimizer)
     optimizer.load_state_dict(state["optimizer"])

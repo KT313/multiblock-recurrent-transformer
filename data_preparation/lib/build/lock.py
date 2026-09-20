@@ -1,11 +1,11 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
 """
-One run per program at a time: an advisory flock on a lock file held for the whole run.
+Advisory reader/writer locks held for the whole operation.
 
-<dataset_dir>/.build.lock guards a build (a second build, or a training run's auto-prepare, would otherwise
-interleave directory removals, shard writes and manifest saves); <out_dir>/.train.lock guards a training run.
-The file records who holds it (program, pid, host, since) for the error message. The OS releases the lock when the
-holder dies, so a lock file is never stale; a run that lost its terminal and continues headless holds it until it
+<dataset_dir>/.build.lock permits multiple read-only training runs or one exclusive preparer/auto-prepare run.
+<out_dir>/<run_name>/.train.lock exclusively guards a training run and records its holder for diagnostics.
+Dataset locks do not record holders. The OS releases ownership once every owning descriptor closes (a forked child can retain one), so an unused
+lock file is never stale; a run that lost its terminal and continues headless holds it until it
 finishes. status and --dry_run do not take it.
 """
 
@@ -57,47 +57,119 @@ class RunLocked(RuntimeError):
         self.path = path
         self.holder = holder
         if holder is None:
-            message = f"{program} expects one run at a time on this system; another run holds {path} (holder unknown)"
+            message = f"{program} cannot acquire {path}: another operation holds a conflicting lock (holder unknown)"
         else:
             message = (
                 f"{holder.program} expects one run at a time on this system; one is already running (started "
-                f"{holder.started()}, pid {holder.pid} on {holder.host}). Wait for it to finish, or stop it with: "
+                f"{holder.started()}, pid {holder.pid} on {holder.host}; protected root {path.parent}). "
+                "Wait for it to finish, or stop it with: "
                 f"kill -INT {holder.pid}"
             )
         super().__init__(message)
 
 
 @contextmanager
-def run_lock(path: Path, program: str) -> Iterator[None]:
+def run_lock(
+    path: Path, program: str, *, shared: bool = False, record_holder: bool = True,
+) -> Iterator[None]:
     """
-    Hold path exclusively for the block as program; :class:`RunLocked` (naming the holder) if it is taken.
+    Hold path without waiting; shared readers coexist, exclusive holders exclude everyone else.
+    Only exclusive holders may write metadata; dataset callers disable metadata entirely.
     """
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    fd = _open_lock_file(path)
+    write_holder = record_holder and not shared
     try:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+            fcntl.flock(fd, mode | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise RunLocked(path, program, _read_holder(path)) from None
-        os.ftruncate(fd, 0)
-        os.write(fd, _holder_record(program).encode())
-        log.debug("holding %s", path)
+            holder = _read_holder(path) if record_holder else None
+            raise RunLocked(path, program, holder) from None
+        if write_holder:
+            os.ftruncate(fd, 0)
+            os.write(fd, _holder_record(program).encode())
+        log.debug("holding %s (%s)", path, "shared" if shared else "exclusive")
         try:
             yield
         finally:
-            os.ftruncate(fd, 0)
+            if write_holder:
+                os.ftruncate(fd, 0)
             fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)
 
 
-def build_lock(root: Path) -> AbstractContextManager[None]:
+def _open_lock_file(path: Path) -> int:
     """
-    The build lock of the dataset directory root (root/.build.lock).
+    Open the lock file read-write; create it only when it is missing.
+
+    An existing file is opened without O_CREAT on purpose. The Linux NFS client forwards the create request to the
+    server unless the name is already in its cache, and some servers then reject the open because the directory is
+    not writable, although the file exists. Dataset directories are commonly made read-only once prepared, so a
+    training run on a fresh node would otherwise fail with "Permission denied" on a lock file it may open.
     """
 
-    return run_lock(root / BUILD_LOCK_NAME, "data preparation")
+    try:
+        return os.open(path, os.O_RDWR)
+    except FileNotFoundError:
+        return os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+
+
+class DatasetLease:
+    """Opaque, process-local ownership, issued only by :func:`dataset_lock`. Never send to workers."""
+
+    __slots__ = ()
+
+    def __init__(self) -> None:
+        raise TypeError("DatasetLease is issued by dataset_lock; it cannot be constructed directly")
+
+
+# Identity membership prevents an ordinary constructed/copied token bypassing the lock. PID rejects fork copies.
+_ACTIVE_LEASES: dict[DatasetLease, tuple[Path, int, bool]] = {}  # root, PID, shared/read-only
+
+
+def validate_dataset_lease(lease: DatasetLease, root: Path, *, shared: bool = False) -> None:
+    """Reject expired, foreign-root, forged or fork-inherited ownership before any dataset access."""
+
+    expected = (root.resolve(), os.getpid())
+    record = _ACTIVE_LEASES.get(lease)
+    if type(lease) is not DatasetLease or record is None or record[:2] != expected:
+        raise ValueError(f"invalid dataset lease for {expected[0]}: ownership must be active in this process")
+    if record[2] and not shared:
+        raise ValueError("a shared dataset lease cannot authorize preparation")
+
+
+@contextmanager
+def dataset_lock(
+    root: Path, program: str = "data preparation", *, lease: DatasetLease | None = None, shared: bool = False,
+) -> Iterator[DatasetLease]:
+    """Hold canonical root/.build.lock (exclusive by default), or borrow a sufficient active lease.
+
+    The inode is never replaced or removed. Cooperating training and all preparation selections use this same
+    lock; status/dry-run remain best-effort read-only observations. Advisory locking cannot restrain external
+    writers. A fork inherits the descriptor, but cannot borrow the parent's lease.
+    """
+
+    root = root.resolve()
+    if lease is not None:
+        validate_dataset_lease(lease, root, shared=shared)
+        yield lease
+        return
+    with run_lock(root / BUILD_LOCK_NAME, program, shared=shared, record_holder=False):
+        owned = object.__new__(DatasetLease)
+        _ACTIVE_LEASES[owned] = (root, os.getpid(), shared)
+        try:
+            yield owned
+        finally:
+            del _ACTIVE_LEASES[owned]
+
+
+def build_lock(root: Path) -> AbstractContextManager[DatasetLease]:
+    """Compatibility entry point for the common exclusive dataset-operation lock."""
+
+    return dataset_lock(root)
 
 
 def _holder_record(program: str) -> str:

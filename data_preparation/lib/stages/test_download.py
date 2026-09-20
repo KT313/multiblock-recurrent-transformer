@@ -23,8 +23,8 @@ import pyarrow.parquet as pq
 import pytest
 from rich.console import Console
 
-from data_preparation.dataset_config import DatasetConfig, SourceConfig, TokenizerConfig
-from data_preparation.layout import DatasetLayout
+from data_preparation.lib.dataset_config import DatasetConfig, SourceConfig, TokenizerConfig
+from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.storage.manifest import Manifest
 from data_preparation.lib.storage.raw_folder import RawFolder
 from data_preparation.lib.sources.loaders import SharedLoaderParameters
@@ -45,10 +45,13 @@ from data_preparation.lib.stages.download import (
     download,
     download_github_code_group,
     inspect_raw,
+    inspect_tokenizer,
     prepare_tokenizer,
     reopen_raw,
 )
 from data_preparation.lib.stages.truncation import CHARS_PER_TOKEN_ESTIMATE, NUMBER_OF_SPECIAL_TOKENS, estimate_tokens
+
+from data_preparation.lib.stages import download_progress, download_state
 
 download_module = importlib.import_module("data_preparation.lib.stages.download")  # the package attribute `download` is the function
 
@@ -89,6 +92,30 @@ def test_prepare_tokenizer_synthetic_is_idempotent(cfg_factory: CfgFactory, layo
     before = (out / "tokenizer.json").stat().st_mtime_ns
     assert prepare_tokenizer(cfg, layout) == manifest
     assert (out / "tokenizer.json").stat().st_mtime_ns == before
+
+
+@pytest.mark.parametrize('state', ['absent', 'empty', 'missing_manifest', 'missing_payload'])
+def test_tokenizer_inspection_warns_only_when_existing_artifacts_need_repair(
+    cfg_factory: CfgFactory, layout: DatasetLayout, caplog: pytest.LogCaptureFixture, state: str,
+) -> None:
+    cfg = cfg_factory({'p': _synthetic()})
+    directory = layout.tokenizer_dir(cfg.tokenizer.name)
+    if state == 'empty':
+        directory.mkdir(parents=True)
+    elif state.startswith('missing_'):
+        prepare_tokenizer(cfg, layout)
+        (directory / ('MANIFEST.json' if state == 'missing_manifest' else 'tokenizer.json')).unlink()
+    existed = directory.exists()
+    before = {p.name: p.read_bytes() for p in directory.iterdir()} if existed else {}
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger='data_preparation'):
+        plan = inspect_tokenizer(cfg, layout)
+    assert plan.needs_publication
+    assert bool(caplog.records) == state.startswith('missing_')
+    if state.startswith('missing_'):
+        assert 'rebuilding from scratch' in caplog.text
+    assert directory.exists() == existed
+    assert ({p.name: p.read_bytes() for p in directory.iterdir()} if existed else {}) == before
 
 
 def test_prepare_tokenizer_rebuilds_on_stale_hash(
@@ -622,8 +649,9 @@ def _raw_state(layout: DatasetLayout, names: list[str], read_rows: Reader) -> di
     return state
 
 
+@pytest.mark.parametrize("prefetch_mb", [0, 1])
 def test_download_github_code_group_equals_separate_downloads(
-    hub: FakeHub, cfg_factory: CfgFactory, with_tokenizer: Prep, tmp_path: Path, read_rows: Reader
+    hub: FakeHub, cfg_factory: CfgFactory, with_tokenizer: Prep, tmp_path: Path, read_rows: Reader, prefetch_mb: int,
 ) -> None:
     """
     Golden: one group pass gives every member the rows, offsets and exhausted flag of its separate download as a
@@ -647,6 +675,7 @@ def test_download_github_code_group_equals_separate_downloads(
     assert expected["rust"]["rows"] == [] and expected["rust"]["exhausted"]
 
     hub.streams.clear()
+    cfg = replace(cfg, download_prefetch_mb=prefetch_mb)
     grouped = DatasetLayout(tmp_path / "grouped")
     prepare_tokenizer(cfg, grouped)
     manifests = download_github_code_group(cfg, list(sources), grouped, rows_needed=rows_needed, shard_size=3)
@@ -822,7 +851,7 @@ def test_download_instruct_drops_long_rows_and_counts_them_once_across_a_resume(
     row exactly once (round-2 bug: the totals were saved from the running counters).
     """
 
-    monkeypatch.setattr(download_module, "TOKEN_BATCH", token_batch)
+    monkeypatch.setattr(download_state, "TOKEN_BATCH", token_batch)
     src_dir = layout.root.parent / "drop"
     write_local(src_dir, _instruct_rows_with_long_and_malformed(30), "jsonl")
     cfg = with_tokenizer(cfg_factory({"d": _local(src_dir, kind="instruct", converter="instruction_input_output")}, dataset_max_sequence_length=5))
@@ -830,10 +859,19 @@ def test_download_instruct_drops_long_rows_and_counts_them_once_across_a_resume(
     with pytest.raises(BuildAborted):
         download(cfg, "d", layout, rows_needed=10, shard_size=4, should_stop=lambda: True)  # checked after each shard
     partial = Manifest.load(layout.raw_dir("d"))
-    # kept rows i = 2, 5, 8, 11 in the shard that tripped the stop, then the row consumed before the stop was seen
-    # (i = 14, published as a short shard): everything consumed is stored, the offset is where the fetch stood
-    assert partial is not None and [(s.rows, s.offset) for s in partial.shards] == [(4, 12), (1, 15)]
-    assert partial.rows_fetched == 15 and (partial.skipped_malformed, partial.dropped_too_long) == (5, 5)
+    # The first shard trips the stop. The producer may already have queued more rows; how many depends on thread
+    # scheduling. Verify the exact saved prefix and per-shard counters, rather than assuming one extra stored row.
+    assert partial is not None and (partial.shards[0].rows, partial.shards[0].offset) == (4, 12)
+    kept = partial.rows()
+    assert 4 <= kept <= 10
+    assert partial.rows_fetched == 3 * kept
+    assert (partial.skipped_malformed, partial.dropped_too_long) == (kept, kept)
+    stored = 0
+    for shard in partial.shards:
+        stored += shard.rows
+        assert shard.offset == 3 * stored
+        assert (shard.skipped_malformed, shard.dropped_too_long) == (stored, stored)
+    assert [row["instruction"] for row in read_rows(layout.raw_dir("d"))] == [f"i{i}" for i in range(2, 3 * kept, 3)]
 
     m = download(cfg, "d", layout, rows_needed=10, shard_size=4)
     assert m.rows() == 10 and m.rows_fetched == 30 and m.skipped_malformed == 10 and m.dropped_too_long == 10
@@ -1024,7 +1062,7 @@ def _failing_loader(monkeypatch: pytest.MonkeyPatch, fail_at: int | None, total:
 def test_download_publishes_shards_as_they_fill_and_resumes_after_a_failure(
     cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, monkeypatch: pytest.MonkeyPatch, read_rows: Reader, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(download_module, "TOKEN_BATCH", 5)  # rows reach the writer in small batches (256 in production)
+    monkeypatch.setattr(download_state, "TOKEN_BATCH", 5)  # rows reach the writer in small batches (2048 in production)
     cfg = with_tokenizer(cfg_factory({"p": _synthetic()}))
     offsets = _failing_loader(monkeypatch, fail_at=27)
     with pytest.raises(OSError, match="connection reset"):
@@ -1051,6 +1089,33 @@ def test_download_publishes_shards_as_they_fill_and_resumes_after_a_failure(
     reference = download(cfg, "p", other, rows_needed=40, shard_size=10)
     assert (reference.rows(), reference.tokens(), reference.rows_fetched) == (m2.rows(), m2.tokens(), m2.rows_fetched)
     assert read_rows(other.raw_dir("p")) == read_rows(raw)
+
+
+def test_prefetched_download_resumes_from_saved_rows_after_stop(
+    hub: FakeHub, cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout,
+    monkeypatch: pytest.MonkeyPatch, read_rows: Reader, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(download_state, "TOKEN_BATCH", 5)
+    hub.add("data/a.parquet", [{"text": f"document {i}"} for i in range(200)])
+    source = SourceConfig(kind="pretrain", loader="hf_files", hf_id=REPO, revision=REV,
+                          load_kwargs={"data_files": "data/*.parquet"})
+    cfg = with_tokenizer(replace(cfg_factory({"p": source}), download_prefetch_mb=1))
+    with pytest.raises(BuildAborted):
+        download(cfg, "p", layout, rows_needed=200, shard_size=5, should_stop=lambda: True)
+    saved = Manifest.load(layout.raw_dir("p"))
+    assert saved is not None and 0 < saved.rows_fetched < 200
+    assert all(handle.closed for handle in hub.handles.values())
+    prefix = read_rows(layout.raw_dir("p"))
+
+    resumed = download(cfg, "p", layout, rows_needed=200, shard_size=5)
+    reference_layout = DatasetLayout(tmp_path / "reference")
+    reference_config = replace(cfg, download_prefetch_mb=0)
+    prepare_tokenizer(reference_config, reference_layout)
+    reference = download(reference_config, "p", reference_layout, rows_needed=200, shard_size=5)
+    expected = read_rows(reference_layout.raw_dir("p"))
+    assert prefix == expected[:len(prefix)]
+    assert read_rows(layout.raw_dir("p")) == expected
+    assert (resumed.rows_fetched, resumed.tokens()) == (reference.rows_fetched, reference.tokens())
 
 
 def test_download_instruct_shard_offsets_count_consumed_source_rows(
@@ -1221,13 +1286,15 @@ def test_download_instruct_filter_calls_the_loader_once_and_closes_it(
 
 class _FakeCounter:
     """
-    A `TokenCounter` stand-in (estimate counts) whose `truncate_many` calls go through `on_batch(call number)` first.
+    A `TokenCounter` stand-in (estimate counts, no tokenizer pool) whose `truncate_many` calls go through
+    `on_batch(call number)` first.
     """
 
     on_batch: Callable[[int], None] = staticmethod(lambda call: None)
     calls = 0
+    pool = None
 
-    def __init__(self, config: DatasetConfig, layout: DatasetLayout) -> None:
+    def __init__(self, config: DatasetConfig, layout: DatasetLayout, pool: Any = None) -> None:
         pass
 
     def truncate_many(self, texts: list[str], max_tokens: int) -> list[tuple[str, int]]:
@@ -1269,7 +1336,7 @@ def test_the_fetch_thread_runs_ahead_of_the_tokenizer(
     ahead of the token worker gets there (in one thread the tokenizer would wait for rows that are never pulled).
     """
 
-    monkeypatch.setattr(download_module, "TOKEN_BATCH", 5)
+    monkeypatch.setattr(download_state, "TOKEN_BATCH", 5)
     tokenizer_may_go = threading.Event()
 
     def on_batch(call: int) -> None:
@@ -1277,7 +1344,7 @@ def test_the_fetch_thread_runs_ahead_of_the_tokenizer(
             assert tokenizer_may_go.wait(timeout=10), "the fetch thread did not run ahead of the tokenizer"
 
     def on_row(yielded: int) -> None:
-        if yielded == 3 * download_module.TOKEN_BATCH:
+        if yielded == 3 * download_state.TOKEN_BATCH:
             tokenizer_may_go.set()
 
     monkeypatch.setattr(_FakeCounter, "on_batch", staticmethod(on_batch))
@@ -1300,7 +1367,7 @@ def test_a_failure_on_the_token_worker_ends_the_download_like_a_loader_failure(
     discarded (the same outcome as the loader failing there), and the next call resumes at shard 2.
     """
 
-    monkeypatch.setattr(download_module, "TOKEN_BATCH", 5)
+    monkeypatch.setattr(download_state, "TOKEN_BATCH", 5)
 
     def on_batch(call: int) -> None:
         if call == 5:
@@ -1337,7 +1404,7 @@ def test_download_github_code_group_resumes_every_folder_aligned_after_a_stop(
     uninterrupted pass. Rows reach the writers in small batches so the stop lands mid-pass.
     """
 
-    monkeypatch.setattr(download_module, "TOKEN_BATCH", 2)
+    monkeypatch.setattr(download_state, "TOKEN_BATCH", 2)
     for prefix in "abcd":
         hub.add(f"data/{prefix}.parquet", _code_rows(prefix, 12))  # row groups of 2; Python, Java, Go in turns
     sources = {"py": _github("Python"), "rust": _github("Rust")}
@@ -1428,7 +1495,7 @@ def bars(monkeypatch: pytest.MonkeyPatch) -> list[_RecordingBar]:
         opened.append(bar)
         return bar
 
-    monkeypatch.setattr(download_module, "progress", fake_progress)
+    monkeypatch.setattr(download_progress, "progress", fake_progress)
     return opened
 
 
@@ -1485,3 +1552,173 @@ def test_download_github_code_group_bar_counts_only_rows_towards_a_target(
     assert second["java"].rows() > 1, "the passive member stored what the pass read on"
     assert layout.raw_dir("name_go").exists(), "the extra language got a folder"
     assert [(bar.initial, bar.total, bar.n) for bar in bars][1] == (1, 4, 4), "java (passive) and Go count for neither total nor n"
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+def test_sharegpt_pipeline_stores_the_exchange_it_checks_and_counts_malformed(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer, read_rows: Reader,
+    caplog: pytest.LogCaptureFixture, filtered: bool,
+) -> None:
+    first = _sharegpt("h" * 60, "a" * 60)
+    first["conversations"].append({"from": "human", "value": "unanswered B"})
+    later_bad = _sharegpt("j" * 60, "b" * 60)
+    later_bad["conversations"].extend(_sharegpt("q" * 60, "```python" + "x" * 60)["conversations"])
+    first_bad = _sharegpt("short", "a" * 60)
+    first_bad["conversations"].extend(_sharegpt("q" * 60, "good" * 20)["conversations"])
+    system = _sharegpt("k" * 60, "c" * 60)
+    system["conversations"].insert(0, {"from": "system", "value": "initial"})
+    system["conversations"].append({"from": "system", "value": "later"})
+    malformed = {"conversations": [{"from": "human", "value": "q"}, {"from": "human", "value": "q2"}]}
+    src_dir = layout.root.parent / "opening"
+    write_local(src_dir, [first, later_bad, first_bad, system, malformed], "jsonl")
+    src = _local(src_dir, kind="instruct", converter="sharegpt_conversations", filter="sharegpt_quality" if filtered else None)
+    cfg = with_tokenizer(cfg_factory({"s": src}))
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        manifest = download(cfg, "s", layout, rows_needed=10)
+    assert manifest.rows_fetched == 5 and manifest.skipped_malformed == 1 and manifest.exhausted
+    stored = [{key: value for key, value in row.items() if key != "tokens"} for row in read_rows(layout.raw_dir("s"))]
+    expected = [
+        {"instruction": "h" * 60, "input": "", "output": "a" * 60},
+        {"instruction": "j" * 60, "input": "", "output": "b" * 60},
+    ]
+    if not filtered:
+        expected.extend([
+            {"instruction": "short", "input": "", "output": "a" * 60},
+            {"instruction": "k" * 60, "input": "initial", "output": "c" * 60},
+        ])
+    assert stored == expected
+    assert "opening turn 1 must be gpt" in caplog.text
+
+
+def test_sharegpt_filter_malformed_openings_use_existing_failure_threshold(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer,
+) -> None:
+    src_dir = layout.root.parent / "malformed_openings"
+    wrong = {"conversations": [{"from": "gpt"}]}  # missing value is still a schema error
+    write_local(src_dir, [wrong] * MAX_CONSECUTIVE_MALFORMED, "jsonl")
+    src = _local(src_dir, kind="instruct", converter="sharegpt_conversations", filter="sharegpt_quality")
+    cfg = with_tokenizer(cfg_factory({"s": src}))
+    with pytest.raises(MalformedSourceError, match="10 consecutive rows") as info:
+        download(cfg, "s", layout, rows_needed=10)
+    assert len(info.value.samples) == MAX_CONSECUTIVE_MALFORMED
+    assert all("needs 'from'/'value' keys" in reason for _, reason in info.value.samples)
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+@pytest.mark.parametrize("system_prefix", [False, True])
+def test_sharegpt_orphan_openings_are_warned_and_skipped_without_aborting(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer,
+    read_rows: Reader, caplog: pytest.LogCaptureFixture, filtered: bool, system_prefix: bool,
+) -> None:
+    count = MAX_CONSECUTIVE_MALFORMED + 2
+    opening = [{"from": "gpt", "value": "orphan answer"}]
+    if system_prefix:
+        opening.insert(0, {"from": "system", "value": "context"})
+    # A later valid pair must not be salvaged from a rejected conversation.
+    orphan = {"conversations": opening + _sharegpt("x" * 60, "y" * 60)["conversations"]}
+    good = _sharegpt("h" * 60, "a" * 60)
+    src_dir = layout.root.parent / "orphan_openings"
+    write_local(src_dir, [orphan] * count + [good], "jsonl")
+    src = _local(src_dir, kind="instruct", converter="sharegpt_conversations",
+                 filter="sharegpt_quality" if filtered else None)
+    cfg = with_tokenizer(cfg_factory({"s": src}))
+    with caplog.at_level(logging.WARNING, logger="data_preparation"):
+        manifest = download(cfg, "s", layout, rows_needed=2)
+    assert manifest.rows() == 1 and manifest.rows_fetched == count + 1 and manifest.exhausted
+    assert manifest.skipped_malformed == count
+    stored = read_rows(layout.raw_dir("s"))
+    assert [(row["instruction"], row["input"], row["output"]) for row in stored] == [("h" * 60, "", "a" * 60)]
+    warnings = [r for r in caplog.records if "orphan assistant opening skipped" in r.getMessage()]
+    assert len(warnings) == count and all(r.levelno == logging.WARNING for r in warnings)
+    # Existing source identity and committed offsets remain reusable, without recounting rejected rows.
+    resumed = download(cfg, "s", layout, rows_needed=2)
+    assert resumed.rows_fetched == manifest.rows_fetched and resumed.skipped_malformed == count
+
+
+def test_sharegpt_orphan_skip_does_not_reset_schema_failure_streak(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer,
+) -> None:
+    broken = {"conversations": [{"from": "gpt"}]}
+    orphan = {"conversations": [{"from": "gpt", "value": "orphan answer"}]}
+    src_dir = layout.root.parent / "mixed_openings"
+    write_local(src_dir, [broken] * (MAX_CONSECUTIVE_MALFORMED - 1) + [orphan, broken], "jsonl")
+    src = _local(src_dir, kind="instruct", converter="sharegpt_conversations", filter="sharegpt_quality")
+    cfg = with_tokenizer(cfg_factory({"s": src}))
+    with pytest.raises(MalformedSourceError, match="10 consecutive rows") as info:
+        download(cfg, "s", layout, rows_needed=1)
+    assert all("needs 'from'/'value' keys" in reason for _, reason in info.value.samples)
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+def test_legacy_sharegpt_identity_refuses_append_and_repair_without_confirmation(
+    cfg_factory: CfgFactory, with_tokenizer: Prep, layout: DatasetLayout, write_local: Writer,
+    read_rows: Reader, mtimes: Mtimes, filtered: bool,
+) -> None:
+    from data_preparation.lib.dataset_config import _stable_hash
+    from data_preparation.lib.build.repair import ConfirmationRequired, repair_broken_and_stale_folders
+
+    src_dir = layout.root.parent / "legacy_sharegpt"
+    write_local(src_dir, [_sharegpt("h" * 60, "a" * 60)] * 3, "jsonl")
+    src = _local(src_dir, kind="instruct", converter="sharegpt_conversations", filter="sharegpt_quality" if filtered else None)
+    cfg = with_tokenizer(cfg_factory({"s": src}))
+    manifest = download(cfg, "s", layout, rows_needed=1)
+    # Emulate the exact unversioned raw identity written by the previous conversion implementation.
+    manifest.hash_payload = {"source": cfg.raw_hash_payload("s")["source"]}
+    manifest.source_hash = _stable_hash(manifest.hash_payload)
+    raw = layout.raw_dir("s")
+    manifest.save(raw)
+    before, rows_before = mtimes(raw), read_rows(raw)
+    inspection = inspect_raw(cfg, "s", layout)
+    assert inspection.state == "stale" and "row_semantics" in inspection.reason
+    with pytest.raises(RawFolderError, match="stale.*row_semantics"):
+        download(cfg, "s", layout, rows_needed=3)
+    with pytest.raises(ConfirmationRequired, match="row_semantics"):
+        repair_broken_and_stale_folders(cfg, layout, assume_yes=False, confirm=lambda message: False)
+    assert mtimes(raw) == before and read_rows(raw) == rows_before and Manifest.load(raw) == manifest
+
+
+def test_tokenizer_parent_symlink_is_rejected_before_publication(
+    cfg_factory: CfgFactory, layout: DatasetLayout, tmp_path: Path,
+) -> None:
+    cfg = cfg_factory({"p": _synthetic()})
+    outside = tmp_path / "outside-tokenizers"
+    published = outside / cfg.tokenizer.name
+    published.mkdir(parents=True)
+    sentinel = published / "keep.txt"
+    sentinel.write_bytes(b"original tokenizer")
+    layout.root.mkdir(parents=True, exist_ok=True)
+    (layout.root / "tokenizers").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="unexpected child symlink"):
+        prepare_tokenizer(cfg, layout)
+    assert sentinel.read_bytes() == b"original tokenizer"
+    assert sorted(item.name for item in outside.iterdir()) == [cfg.tokenizer.name]
+
+
+def test_tokenizer_staging_leaves_unowned_sibling_untouched(cfg_factory: CfgFactory, layout: DatasetLayout) -> None:
+    cfg = cfg_factory({"p": _synthetic()})
+    published = layout.tokenizer_dir(cfg.tokenizer.name)
+    sibling = published.with_name(published.name + ".tmp")
+    sibling.mkdir(parents=True)
+    sentinel = sibling / "unrelated-data"
+    sentinel.write_bytes(b"do not remove")
+    prepare_tokenizer(cfg, layout)
+    cfg.tokenizer.revision = "replacement"
+    prepare_tokenizer(cfg, layout)
+    assert sentinel.read_bytes() == b"do not remove"
+    assert not list(published.parent.glob(".tokenizer-*"))
+
+
+@pytest.mark.parametrize("missing", ["tokenizer.json", "tokenizer_config.json"])
+def test_tokenizer_only_preparation_repairs_missing_payload(cfg_factory: CfgFactory, layout: DatasetLayout, missing: str) -> None:
+    from data_preparation.lib.build.planner import tokenizer_is_prepared
+    from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
+
+    cfg = cfg_factory({"p": _synthetic()})
+    original = prepare_tokenizer(cfg, layout)
+    directory = layout.tokenizer_dir(cfg.tokenizer.name)
+    (directory / missing).unlink()
+    assert not tokenizer_is_prepared(cfg, layout)
+    replacement = prepare_tokenizer(cfg, layout)
+    assert replacement.generation_id != original.generation_id
+    assert tokenizer_is_prepared(cfg, layout)
+    assert SavedTokenizer(directory).encode("hello")

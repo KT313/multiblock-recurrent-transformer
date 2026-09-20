@@ -1,14 +1,11 @@
-# Final thesis run (crow-300m-final, 308M params, ~4.95B tokens over three stages), expressed for one local GPU.
+# Training run (crow-300m-final, 308M params, ~4.95B tokens over three stages), expressed for one local GPU.
 #
 # This file lists EVERY run setting (`training/settings.py:Settings`) with its value, so the available knobs are
 # visible at a glance; a run config may also list only the keys it changes. Any key can be overridden from the
 # command line: `python training/train.py --config config/crow_300m_final.yaml --run_name my-run`.
 #
 # All step values are OPTIMIZER steps. One step = micro_batches_per_step × tokens_per_micro_batch = 256 × 8192 ≈ 2.1M
-# tokens, so the three stages give 1573 + 715 + 71 = 2359 steps. The thesis ran with 64 micro-batches per step on
-# 4 GPUs; on one GPU the same step is 256 packs, so it takes correspondingly longer.
-# (Old microbatch-step values ÷ 64: warmup 4096 → 64, cooldown 4096 → 64,
-#  save 8192 → 128, eval 1024 → 16.)
+# tokens, so the three stages give 1573 + 715 + 71 = 2359 steps.
 #
 # Model: the architecture (sizes, depth, recurrence) is defined in config/model_architecture/crow_300m_final.yaml;
 # `model_overwrite` changes single keys of it. Data: sources, per-stage token budgets/weights (3.3B + 1.5B + 0.15B
@@ -47,9 +44,10 @@ training_max_sequence_length: 2048   # documents are cut to this many tokens at 
 backend: single_device               # training backend (training/backend/): single_device = one GPU (CPU fallback); ddp = one process per GPU, launched with torchrun (make training-ddp ... GPUS=n; docs/distributed_training.md)
 precision: bf16-mixed                # autocast precision of the forward/backward pass
 compile_model: true                  # torch.compile the model
+use_custom_kernels: true        # require the CUDA kernel trio; false selects native operations
+loss_normalization: supervised_token_v1  # fixed objective version; legacy resume requires allow_settings_change
 gradient_checkpointing: none         # none | selective | full: recompute the activations of the recurrence iterations in the backward pass.
-                                     # selective keeps the GEMM and FlexAttention outputs and recomputes only the cheap ops (v2_small, 8192-token packs:
-                                     # ~6 % slower than none, 75 % of the peak memory); full recomputes the whole iteration (~22 % slower, 35 % of the memory)
+                                     # selective saves GEMM and FlexAttention outputs; full recomputes the whole iteration.
 
 # --- Sequence packing (the training batches; validation runs on padded rows, see below) -----------------------
 # Documents laid end to end into ONE row of tokens_per_micro_batch tokens per micro-batch, never split, attention
@@ -58,14 +56,15 @@ tokens_per_micro_batch: 8192            # pack length in tokens, >= training_max
 micro_batches_per_step: 256             # packs per optimizer step, a multiple of the number of devices; 256 x 8192 = 2,097,152 tokens per step
 
 # --- Optimizer + LR schedule ------------------------------------------------------------------------------------
-optimizer: ELLISAdam                 # optimizer class (training/optim.py: ELLISAdam or any torch.optim name)
+optimizer: ELLISAdam                 # optimizer class (training/optim: AdamW, ELLISAdam, or ELLISAdam8bit = ELLISAdam with 8-bit moments for every group but the embeddings, 2 instead of 8 bytes of state per parameter)
+optimizer_sharding: none             # none | zero1: distribute optimizer state; zero1 requires backend: ddp
 optim_config:                        # constructor options of the optimizer (training/settings.py:OptimizerConfig);
                                      # single keys override from the CLI without replacing the rest: --optim_config.lr 3e-4
   lr: 1e-4            # NOT the schedule's LR (stage_base_lrs is): ELLISAdam keeps it as init_lr, the reference of the decoupled weight decay (decay = lr / init_lr × weight_decay per step); changing it changes the regularisation
   weight_decay: 4e-5  # decoupled
   betas: [0.9, 0.95]
   eps: null           # null: the optimizer's own default (ELLISAdam 1e-6, torch AdamW 1e-8)
-  update_clipping: true  # this and the three below exist only on ELLISAdam
+  update_clipping: true  # this and the three below exist only on ELLISAdam / ELLISAdam8bit
   atan_adam: true
   running_init: true
   decouple_wd: true
@@ -78,7 +77,8 @@ min_lr: 0                            # LR floor of warmup and cooldown
 
 # --- Evaluation / logging / checkpoints -------------------------------------------------------------------------
 log_step_interval: 1                 # log training metrics every this many steps
-log_gradient_metrics: true           # per-parameter-group gradient/update statistics at every log step
+log_gradient_metrics_interval: 1     # expensive gradient/update statistics every N optimizer steps; 0 disables; otherwise a multiple of log_step_interval
+log_correlations: ""                # optional detailed correlations at that interval: adapter,attention,mlp
 eval_step_interval: 16               # run validation every this many steps
 eval_iters: 64                       # validation batches per evaluated depth
 validation_batch_size: 4             # rows per validation forward (validation batches are padded rows, not packs)
@@ -99,13 +99,16 @@ export_hf_path: null                 # target of the export; null: {out_dir}/{ru
 # {run dir}/benchmarks/, named by step. Benchmarks need the eval extra (uv sync --extra eval) and network.
 sample_step_interval: 0              # write sample generations every this many steps (0: never)
 sample_at_training_progress: [100]   # ... and after the steps at these percentages of the run (0: after the first step, 100: after the last); combined with the interval
+sample_batch_size: 8                 # fixed prompts per sample batch; 1 exposes more GPU jobs
 sample_max_new_tokens: 64            # tokens generated per prompt
-sample_temperature: 0.0              # 0: greedy decoding
+sample_use_cache: true              # fixed per-token/core latents and per-recurrence K/V; false: legacy resampling
+sample_temperature: 0.0              # scalar or list, e.g. [0.0, 0.7]; 0: greedy decoding
 sample_recurrences: []               # recurrent steps per block per sampling pass, e.g. [[4, 4, 4], [12, 12, 12]]; empty: the mean recurrence once
 benchmark_step_interval: 0           # run the benchmarks every this many steps (0: never)
 benchmark_at_training_progress: []   # ... and at these percentages of the run, like sample_at_training_progress
-benchmark_tasks: [arc_challenge, hellaswag, mmlu, winogrande]   # lm-eval task names (the thesis benchmarks)
+benchmark_tasks: [arc_challenge, hellaswag, mmlu, winogrande]   # lm-eval task names
 benchmark_limit: null                # examples per task (null: all); a few hundred keeps in-training runs short
+benchmark_apply_chat_template: false  # explicit chat protocol; plain benchmark prompts remain the default
 benchmark_num_fewshot: -1         # examples in the context of every task (-1: each task's own default, e.g. 5 for gsm8k)
 benchmark_batch_size: 8              # sequences per lm-eval forward
 benchmark_recurrences: []            # like sample_recurrences, for the benchmarks

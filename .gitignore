@@ -25,8 +25,13 @@ outputs/
 
 # local agent instructions, not part of the repo
 CLAUDE.md
+AGENTS.md
 reviews/
 tasks/
 .claude/
 reports/
-tools/
+audits/
+tools/*
+!tools/__init__.py
+!tools/data_preparation/
+tools/data_preparation/native/target/

@@ -10,6 +10,7 @@ from typing import Any, cast
 import pytest
 import torch
 from torch import Tensor
+from torch._dynamo.testing import CompileCounter
 
 from model import build_model
 from model.test_config import TINY_ARCHITECTURE, tiny_config
@@ -46,7 +47,65 @@ def per_block(values: int | list[int]) -> list[int]:
 
 def seeded_tiny(seed: int = 0, **kwargs: Any) -> RecurrentGPT:
     torch.manual_seed(seed)
-    return build_model(TINY_ARCHITECTURE, **kwargs)
+    return build_model(TINY_ARCHITECTURE, **({"use_custom_kernels": False} | kwargs))
+
+
+def test_residual_scaling_reaches_all_layers_without_changing_weights_or_outer_skip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plain = seeded_tiny()
+    rng_plain = torch.get_rng_state().clone()
+    scaled = seeded_tiny(residual_scaling='inverse_sqrt_depth')
+    assert torch.equal(torch.get_rng_state(), rng_plain)
+    assert plain.state_dict().keys() == scaled.state_dict().keys()
+    for name, value in plain.state_dict().items():
+        assert torch.equal(value, scaled.state_dict()[name]), name
+    layers = [module for module in scaled.modules() if isinstance(module, SandwichBlock)]
+    assert len(layers) == 5  # prelude 2, two cores of one layer each, coda 1
+    assert all(layer.residual_scale == scaled.config.residual_scale for layer in layers)
+    def constant_core(*args: Any, **kwargs: Any) -> Tensor:
+        return torch.ones(1, 3, scaled.config.n_embd)
+    monkeypatch.setattr(scaled, 'run_core_block', constant_core)
+    x = torch.zeros(1, 3, scaled.config.n_embd)
+    actual = scaled.run_core_blocks(x, scaled.freqs_cis[:, :3], None, [(1, 0), (8, 0)])
+    assert torch.equal(actual, x+2)  # each whole-core output still added at gain 1
+
+
+def test_nonorthogonal_model_initialization_and_checkpoint_restore(monkeypatch: pytest.MonkeyPatch) -> None:
+    from model.layers.init import checkpoint_initialization
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError('nonorthogonal initialization must not call QR')
+    monkeypatch.setattr(torch.linalg, 'qr', forbidden)
+    model = seeded_tiny(init_orthogonal=False)
+    assert model.lm_head.weight is model.transformer.wte.weight
+    for name, parameter in model.named_parameters():
+        if 'bias' in name:
+            assert torch.count_nonzero(parameter) == 0, name
+        elif parameter.ndim == 1:
+            assert torch.equal(parameter, torch.ones_like(parameter)), name
+        else:
+            output_projection = name.endswith(('attn.proj.weight', 'mlp.proj.weight'))
+            std = model.config.init.table['out_proj' if output_projection else 'std']
+            assert parameter.abs().max() <= 3*std, name
+            assert torch.count_nonzero(parameter) > 0, name
+    batch = ids(batch=1, seq=8)
+    torch.manual_seed(456)
+    output = model(batch, labels=batch, num_steps=(1, 1))
+    loss = output['loss']
+    assert loss is not None and torch.isfinite(loss)
+    loss.backward()
+    for name, parameter in model.named_parameters():
+        assert parameter.grad is not None and torch.isfinite(parameter.grad).all(), name
+    with checkpoint_initialization():
+        restored = RecurrentGPT(model.config)
+    restored.load_state_dict(model.state_dict(), strict=True)
+    assert restored.lm_head.weight is restored.transformer.wte.weight
+    for name, parameter in restored.state_dict().items():
+        assert torch.equal(parameter, model.state_dict()[name]), name
+    torch.manual_seed(456)
+    restored_loss = restored(batch, labels=batch, num_steps=(1, 1))['loss']
+    assert restored_loss is not None
+    torch.testing.assert_close(restored_loss, loss, rtol=0, atol=0)
 
 
 # --- structure -------------------------------------------------------------------------------------------------------
@@ -579,9 +638,10 @@ def test_a_padding_mask_hides_the_pad_tokens_from_the_real_ones(
 
 
 @pytest.mark.parametrize("mode", ["selective", "full"])
-def test_gradient_checkpointing_matches_plain_path(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
-    plain = seeded_tiny()
-    ckpt = seeded_tiny(gradient_checkpointing=mode)
+@pytest.mark.parametrize('scaling', ['none', 'inverse_sqrt_depth'])
+def test_gradient_checkpointing_matches_plain_path(monkeypatch: pytest.MonkeyPatch, mode: str, scaling: str) -> None:
+    plain = seeded_tiny(residual_scaling=scaling)
+    ckpt = seeded_tiny(gradient_checkpointing=mode, residual_scaling=scaling)
     assert ckpt.gradient_checkpointing == mode
     calls: list[int] = []
     wrapper_name = {"selective": "_selective_checkpoint", "full": "_full_checkpoint"}[mode]
@@ -687,6 +747,31 @@ def test_out_of_range_labels_are_masked_too() -> None:
 
 
 # --- packed sequences ---------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('autocast', [False, True])
+def test_loss_only_hook_preserves_logits_path_and_tied_gradients(autocast: bool) -> None:
+    model = seeded_tiny(vocab_size=500)
+    tokens = ids(batch=1, seq=8) % 500
+    labels = tokens.clone()
+    labels[0, 0] = 505
+    labels[0, 1] = -100
+    results: list[tuple[Tensor, dict[str, Tensor]]] = []
+    for return_logits in (True, False):
+        model.zero_grad(set_to_none=True)
+        torch.manual_seed(99)
+        with torch.autocast('cpu', dtype=torch.bfloat16, enabled=autocast):
+            output = model(tokens, labels=labels, num_steps=(1, 1), return_logits=return_logits)
+        loss = output['loss']
+        assert loss is not None
+        loss.backward()
+        assert (output['logits'] is not None) == return_logits
+        results.append((loss.detach(), {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}))
+    torch.testing.assert_close(results[0][0], results[1][0], atol=0, rtol=0)
+    assert results[0][1].keys() == results[1][1].keys()
+    for name, grad in results[0][1].items():
+        torch.testing.assert_close(grad, results[1][1][name], atol=0, rtol=0)
+    assert model.lm_head.weight is model.transformer.wte.weight
 
 
 def _packed_inputs(documents: list[Tensor], pack_length: int) -> tuple[Tensor, Tensor, Tensor]:
@@ -846,6 +931,47 @@ def test_compile_smoke() -> None:
     out["loss"].backward()
 
 
+@pytest.mark.parametrize("mean", [1, 4])
+def test_compile_sampling_context_changes_without_new_graphs(monkeypatch: pytest.MonkeyPatch, mean: int) -> None:
+    """Changing eager metadata must not specialize compiled numerical frames, even beyond the cache limit."""
+    torch._dynamo.reset()
+    model = seeded_tiny(mean_recurrence=mean, mean_backprop_depth=min(mean, 2))
+    contexts: list[tuple[int, int, int]] = []
+    depths: list[int] = []
+    original = model.sample_block_depths
+
+    @torch._dynamo.disable(recursive=False)  # type: ignore[no-untyped-call, untyped-decorator]
+    def record(block_idx: int = 0) -> tuple[Tensor, Tensor]:
+        contexts.append((model.step, model.micro_batch_index, block_idx))
+        steps: tuple[Tensor, Tensor] = original(block_idx)
+        depths.append(int(steps[0].item()) + int(steps[1].item()))
+        return steps
+
+    monkeypatch.setattr(model, "sample_block_depths", record)
+    counter = CompileCounter()
+    compiled = torch.compile(model, backend=counter, dynamic=True)
+    x = ids(1, 4)
+    counts = []
+    try:
+        # A plateau must mean graph reuse, never eager fallback after exhausting Dynamo's cache.
+        with torch._dynamo.config.patch(fail_on_recompile_limit_hit=True):
+            for index in range(40):
+                model.step, model.micro_batch_index = divmod(index, 8)
+                compiled(x, labels=x)["loss"].backward()
+                model.zero_grad(set_to_none=True)
+                counts.append(counter.frame_count)
+        assert counts[0] > 0
+        # Different grad/no-grad tensor paths may compile during warmup; changing context must then plateau.
+        assert counts[-16:] == [counts[-1]] * 16
+        if mean == 1:
+            assert counts == [counts[0]] * 40
+        else:
+            assert len(set(depths)) > 1
+        assert contexts == [(step, micro, core) for step in range(5) for micro in range(8) for core in range(2)]
+    finally:
+        torch._dynamo.reset()
+
+
 # --- the bf16 residual stream ------------------------------------------------------------------------------------------
 
 
@@ -859,7 +985,7 @@ def norm_output_dtypes(model: RecurrentGPT, autocast: bool) -> dict[str, torch.d
     for name, module in model.named_modules():
         if isinstance(module, (RMSNorm, torch.nn.LayerNorm)):
             handles.append(
-                module.register_forward_hook(lambda _m, _i, out, name=name: seen.__setitem__(name, out.dtype))
+                module.register_forward_hook(lambda _m, _i, out, name=name: seen.__setitem__(name, cast(Tensor, out).dtype))
             )
     model.eval()
     with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):

@@ -7,7 +7,6 @@ pools of every process the tests start (the PTY runs of train.py and prepare.py,
 inductor compile worker pool, so the workers do not oversubscribe the cores. GPU tests share one worker (`xdist_group`).
 """
 
-import fcntl
 import os
 import shutil
 import tempfile
@@ -33,8 +32,7 @@ import torch
 if "PYTEST_XDIST_WORKER_COUNT" in os.environ:
     torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
 
-from data_preparation.dataset_config import DatasetConfig, load_dataset_config
-from data_preparation.layout import DatasetLayout
+from data_preparation import DatasetConfig, load_dataset_config, DatasetLayout
 from data_preparation.lib.build.runner import prepare
 from model import RecurrentGPT
 
@@ -104,27 +102,22 @@ def session_shared_base(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 @pytest.fixture(scope="session")
-def tiny_dataset_dir(session_shared_base: Path, tiny_dataset_config: DatasetConfig) -> Path:
+def tiny_dataset_dir(tmp_path_factory: pytest.TempPathFactory, tiny_dataset_config: DatasetConfig) -> Path:
     """
     `config/datasets/tiny.yaml` built into a session temp root: the `dataset/` layout (sources/, processed/,
-    tokenizers/) that `config/tiny.yaml` expects under `dataset/`. Built once per session, under xdist by the first
-    worker that needs it (the others wait on the lock and reuse the build).
+    tokenizers/) that `config/tiny.yaml` expects under `dataset/`. Built once per worker: training now holds an
+    exclusive dataset lease, so parallel tests must not share a dataset root. Build at its final test path rather
+    than copying another worker's dataset and its path-bound ownership records.
     """
 
-    base = session_shared_base
-    root = base / "tiny_dataset"
-    ready = base / "tiny_dataset.ready"
-    with open(base / "tiny_dataset.lock", "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        if not ready.exists():
-            prepare(TINY_DATASET_CONFIG, root, assume_yes=False)
-            ready.touch()
+    root = tmp_path_factory.getbasetemp() / "tiny_dataset"
+    prepare(TINY_DATASET_CONFIG, root, assume_yes=False)
     return root
 
 
 @pytest.fixture(scope="session")
-def tiny_layout(tiny_dataset_dir: Path) -> DatasetLayout:
-    return DatasetLayout(tiny_dataset_dir)
+def tiny_layout(tiny_dataset_dir: Path, tiny_dataset_config: DatasetConfig) -> DatasetLayout:
+    return DatasetLayout(tiny_dataset_dir).for_config(tiny_dataset_config)
 
 
 @pytest.fixture(scope="session")
@@ -159,4 +152,4 @@ def tiny_model() -> RecurrentGPT:
     from model import build_model
 
     torch.manual_seed(0)
-    return build_model(TINY_MODEL_ARCHITECTURE)
+    return build_model(TINY_MODEL_ARCHITECTURE, use_custom_kernels=False)

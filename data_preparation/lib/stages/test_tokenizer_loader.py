@@ -12,11 +12,12 @@ import json
 import random
 import shutil
 from pathlib import Path
+from typing import Any
 
 import pytest
 from transformers import AutoTokenizer
 
-from data_preparation.dataset_config import TokenizerConfig, load_dataset_config
+from data_preparation.lib.dataset_config import TokenizerConfig, load_dataset_config
 from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -86,6 +87,11 @@ def tokenizer_dir(request: pytest.FixtureRequest, tiny_tokenizer_dir: Path, tmp_
 
 def test_ids_offsets_specials_and_decode_match_transformers(tokenizer_dir: Path) -> None:
     loader = SavedTokenizer(tokenizer_dir)
+    assert loader.count_batch(CORPUS) == [len(encoding.ids) for encoding in loader.encode_batch(CORPUS)]
+    assert loader.count_batch([]) == []
+    for encoding in loader.encode_batch(CORPUS):
+        assert len(encoding) == len(encoding.ids)
+        assert [encoding.token_to_chars(i) for i in range(len(encoding))] == encoding.offsets
     counting = AutoTokenizer.from_pretrained(str(tokenizer_dir))  # what TokenCounter loaded
     training = AutoTokenizer.from_pretrained(str(tokenizer_dir), add_bos_token=False, add_eos_token=False)  # what Tokenizer loaded
 
@@ -136,3 +142,16 @@ def test_refuses_clean_up_tokenization_spaces(tiny_tokenizer_dir: Path, tmp_path
     directory = _copy_with_config(tiny_tokenizer_dir, tmp_path / "cleanup", clean_up_tokenization_spaces=True)
     with pytest.raises(ValueError, match="clean_up_tokenization_spaces"):
         SavedTokenizer(directory)
+
+
+def test_count_batch_works_without_the_new_fast_api(tiny_tokenizer_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    loader = SavedTokenizer(tiny_tokenizer_dir)
+    expected = loader.count_batch(CORPUS)
+    backend = loader._tokenizer
+
+    class LegacyBackend:
+        def encode_batch(self, texts: list[str], **kwargs: Any) -> Any:
+            return backend.encode_batch(texts, **kwargs)
+
+    monkeypatch.setattr(loader, "_tokenizer", LegacyBackend())
+    assert loader.count_batch(CORPUS) == expected

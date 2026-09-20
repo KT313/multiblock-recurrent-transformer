@@ -11,7 +11,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from data_preparation.dataset_config import SourceConfig
+from data_preparation.lib.dataset_config import SourceConfig
+from data_preparation.lib.conversation_format import validate_messages
+from data_preparation.lib.sources.conversations import opening_exchange
+from data_preparation.lib.sources.instruction_messages import INSTRUCTION_PAIR_CONVERTERS, check_opencode_score, convert_opencode_messages, convert_webinstruct_messages, convert_nemotron_messages
 
 Row = dict[str, Any]
 Converter = Callable[[Row], Row]
@@ -64,19 +67,14 @@ def _conversations(row: Row) -> list[Any]:
 
 def sharegpt_conversations(row: Row) -> Row:
     """
-    SlimOrca / ShareGPT `conversations` with `from`/`value` turns: system->input, human->instruction, gpt->output.
+    Keep the first complete opening [system,] human/GPT exchange; ignore all subsequent turns.
 
-    Later turns of the same role overwrite earlier ones (as in the thesis pipeline: only one exchange is kept).
+    System context becomes input, the opening human instruction, and its GPT reply output. Malformed
+    openings raise ValueError; no later exchange is searched for and later context cannot leak backward.
     """
 
-    by_role = {"system": "", "human": "", "gpt": ""}
-    for turn in _conversations(row):
-        if not isinstance(turn, dict) or "from" not in turn:
-            raise ValueError(f"sharegpt_conversations: turns need 'from'/'value' keys, got {turn!r}")
-        role = turn["from"]
-        if role in by_role:
-            by_role[role] = text_or_empty(turn.get("value"))
-    return {"instruction": by_role["human"], "input": by_role["system"], "output": by_role["gpt"]}
+    selected = opening_exchange(row)
+    return {"instruction": selected.question, "input": selected.system, "output": selected.answer}
 
 
 def first_two_turns(row: Row) -> Row:
@@ -131,6 +129,9 @@ def instruction_input_output(row: Row) -> Row:
 
 
 CONVERTERS: dict[str, Converter] = {
+    "opencode_messages": convert_opencode_messages,
+    "webinstruct_messages": convert_webinstruct_messages,
+    "nemotron_messages": convert_nemotron_messages,
     "gsm8k_question_answer": gsm8k_question_answer,
     "sharegpt_conversations": sharegpt_conversations,
     "first_two_turns": first_two_turns,
@@ -143,8 +144,11 @@ IDENTITY_FORMAT = "columns instruction, output[, input]"
 # What each named converter expects a source row to look like, in the words of the error that fails a download
 # after too many malformed rows in a row (the row's own column names and value types are printed next to it).
 EXPECTED_FORMATS: dict[str, str] = {
+    "opencode_messages": "nonempty string input/output with numeric average_test_score",
+    "webinstruct_messages": "nonempty string question/answer",
+    "nemotron_messages": "reasoning off and alternating user/assistant messages, optional leading system",
     "gsm8k_question_answer": "columns question, answer",
-    "sharegpt_conversations": "a `conversations` list of `{from, value}` turns (from: system / human / gpt)",
+    "sharegpt_conversations": "a `conversations` list opening with [system,] human, gpt turns, each with from/value keys",
     "first_two_turns": "a `conversations` list of at least two `{value}` turns (instruction, then output)",
     "instruction_input_output": IDENTITY_FORMAT,
 }
@@ -165,18 +169,31 @@ def expected_format(source: SourceConfig) -> str:
     return EXPECTED_FORMATS.get(source.converter, f"whatever converter {source.converter!r} accepts (no description registered)")
 
 
-def get_converter(source: SourceConfig) -> Converter | None:
-    """
-    `fields` mapping first, then the named `converter`, else None (row used as is; `text_field` applied later).
-    """
+def wrap_instruction_converter(convert: Converter) -> Converter:
+    """Represent the selected pair as messages, retaining optional input/system context inside the user prompt."""
+    def convert_messages(raw: Row) -> Row:
+        row = convert(raw)
+        prompt = row["instruction"]
+        if row.get("input"):
+            prompt += "\n\n" + row["input"]
+        return {"messages": validate_messages([{"role": "user", "content": prompt},
+                                              {"role": "assistant", "content": row["output"]}])}
+    return convert_messages
 
+
+def get_converter(source: SourceConfig) -> Converter | None:
+    """Select the existing row converter, then adapt instruction pairs only for explicit message formatting."""
     if source.fields is not None:
-        return fields_converter(source.fields)
-    if source.converter is None:
+        convert = fields_converter(source.fields)
+    elif source.converter is None:
         return None
-    if source.converter not in CONVERTERS:
-        raise ValueError(f"unknown converter {source.converter!r}; known converters: {sorted(CONVERTERS)}")
-    return CONVERTERS[source.converter]
+    else:
+        if source.converter not in CONVERTERS:
+            raise ValueError(f"unknown converter {source.converter!r}; known converters: {sorted(CONVERTERS)}")
+        convert = CONVERTERS[source.converter]
+    if source.instruction_format == "messages" and (source.fields is not None or source.converter in INSTRUCTION_PAIR_CONVERTERS):
+        return wrap_instruction_converter(convert)
+    return convert
 
 
 # --- filters ----------------------------------------------------------------------------------------------------------
@@ -188,28 +205,23 @@ SHAREGPT_CODE_BLOCK_MARKERS = ("```python", "```java", "```cpp", "```javascript"
 
 def sharegpt_quality(row: Row) -> bool:
     """
-    ShareGPT quality filter: human->gpt opening, 50-2000 chars per side, no code blocks in the answer.
+    Check the selected opening human/GPT exchange: 50-2000 chars per side, no listed code markers.
+
+    A valid system-prefixed opening remains quality-ineligible, as before. Malformed openings raise
+    ValueError so the download's malformed-row diagnostics apply instead of counting them as low quality.
     """
 
-    conversations = row.get("conversations")
-    if not isinstance(conversations, list) or len(conversations) < 2:
+    selected = opening_exchange(row)
+    if selected.question_index != 0:
         return False
-    first, second = conversations[0], conversations[1]
-    if not isinstance(first, dict) or not isinstance(second, dict):
-        return False
-    if first.get("from") != "human" or second.get("from") != "gpt":
-        return False
-
-    human_text = str(first.get("value", ""))
-    gpt_text = str(second.get("value", ""))
-    for text in (human_text, gpt_text):
+    for text in (selected.question, selected.answer):
         if not SHAREGPT_MIN_CHARS <= len(text) <= SHAREGPT_MAX_CHARS:
             return False
-    answer = gpt_text.lower()
+    answer = selected.answer.lower()
     return not any(marker in answer for marker in SHAREGPT_CODE_BLOCK_MARKERS)
 
 
-FILTERS: dict[str, Filter] = {"sharegpt_quality": sharegpt_quality}
+FILTERS: dict[str, Filter] = {"sharegpt_quality": sharegpt_quality, "opencode_passed_tests": check_opencode_score}
 
 
 def get_filter(name: str) -> Filter:

@@ -1,8 +1,8 @@
 # Development entry points. Everything runs through uv (no manual venvs).
 .PHONY: setup test typecheck lint download prepare status training training-ddp training-autotune evaluate
 
-setup:  ## create/update the uv environment (incl. data-prep extras and dev tools)
-	uv sync --all-extras
+setup:  ## create/update the uv environment (training, data preparation, evaluation, and dev tools)
+	uv sync
 	uv run python -c "import torch; print('torch', torch.__version__, '| cuda:', torch.cuda.is_available())"
 
 test:  ## run the whole test suite

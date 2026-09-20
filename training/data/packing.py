@@ -20,7 +20,7 @@ import torch
 
 from training.data.collate import Sample, mask_label_ids, shift_inputs_and_labels
 from training.data.tokenizer import IGNORE_INDEX
-from training.data.tokenizer import Tokenizer
+from training.data.tokenizer import TokenMetadata
 
 log = logging.getLogger(__name__)
 
@@ -152,7 +152,7 @@ class PackPool:
 
 
 def pack_samples(
-    samples: list[Sample], pack_length: int, tokenizer: Tokenizer, ignore_index: int = IGNORE_INDEX
+    samples: list[Sample], pack_length: int, tokenizer: TokenMetadata, ignore_index: int = IGNORE_INDEX
 ) -> PackedBatch:
     """
     The `PackedBatch` of `samples` (in this order) for a pack of `pack_length` tokens.

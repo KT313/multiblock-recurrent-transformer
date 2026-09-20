@@ -3,9 +3,9 @@
 Row -> (input_ids, labels) formatting functions, selected by data_signature["format_fn"].
 
 Every function returns two equal-length torch.long tensors. Positions that must not be supervised are
-`IGNORE_INDEX` in labels, never a token id, so a real `<unk>` or `<pad>` token stays supervised. Two formats exist:
+`IGNORE_INDEX` in labels, never a token id, so a real `<unk>` or `<pad>` token stays supervised. Legacy formats:
 pass_text (pretrain sources) and concatenate_instruction_input_output (instruct sources,
-`INSTRUCT_DATA_SIGNATURE` of the dataset resolver).
+`INSTRUCT_DATA_SIGNATURE` of the dataset resolver). Opt-in message sources use format_conversation for all assistant spans.
 """
 
 from typing import Any, Callable
@@ -13,6 +13,7 @@ from typing import Any, Callable
 import torch
 
 from data_preparation.lib.stages.row_pipeline import instruct_text
+from data_preparation.lib.conversation_format import encode_chat_prompt, fit_conversation
 from training.data.tokenizer import IGNORE_INDEX, Tokenizer
 
 Row = dict[str, Any]
@@ -56,7 +57,19 @@ def concatenate_instruction_input_output(
     return input_ids, labels
 
 
+def format_conversation(
+    row: Row, tokenizer: Tokenizer, add_bos: bool, add_eos: bool, max_tokens: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fit complete exchanges and supervise every assistant body and its end marker."""
+    encoded = fit_conversation(row.get("messages"), tokenizer, max_tokens, bos=add_bos, eos=add_eos)
+    inputs = torch.tensor(encoded.ids, dtype=torch.long)
+    labels = inputs.clone()
+    labels[~torch.tensor(encoded.supervised, dtype=torch.bool)] = IGNORE_INDEX
+    return inputs, labels
+
+
 FORMAT_FNS: dict[str, FormatFn] = {
+    "format_conversation": format_conversation,
     "pass_text": pass_text,
     "concatenate_instruction_input_output": concatenate_instruction_input_output,
 }
@@ -68,3 +81,21 @@ def apply_formatting(row: Row, tokenizer: Tokenizer, add_bos: bool, add_eos: boo
     """
 
     return FORMAT_FNS[row["data_signature"]["format_fn"]](row, tokenizer, add_bos, add_eos)
+
+
+def encode_generation_prompt(
+    tokenizer: Tokenizer, text: str, *, kind: str = "continuation", messages: list[dict[str, str]] | None = None,
+) -> list[int]:
+    """Apply the training format's unfinished prefix: plain BOS/text or history ending at the assistant header."""
+    if kind not in ("continuation", "instruction", "chat"):
+        raise ValueError(f"unknown generation prompt kind {kind!r}")
+    if kind == "continuation":
+        if messages is not None:
+            raise ValueError("continuation prompts cannot contain chat messages")
+        return tokenizer.encode(text, bos=True)  # no closing EOS: the model must continue this document
+    if tokenizer.profile:
+        conversation = messages if messages is not None else [{"role": "user", "content": text}]
+        return encode_chat_prompt(conversation, tokenizer)
+    if kind == "chat" or (messages is not None and len(messages) != 1):
+        raise ValueError("structured chat generation requires the literal chat tokenizer profile")
+    return tokenizer.encode(text, bos=True)  # retain the selected legacy instruction formatter's plain prefix

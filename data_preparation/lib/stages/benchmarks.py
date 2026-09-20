@@ -93,3 +93,37 @@ def load_benchmark_ngrams(names: list[str], n: int = 13, cache_dir: str | None =
     total = sum(len(ngrams) for ngrams in all_ngrams.values())
     log.info("benchmarks: %d unique %d-grams in total", total, n)
     return all_ngrams
+
+
+# Exact-example seeds use labelled evaluation splits, independently of the n-gram registry.
+BLOOM_BENCHMARKS: dict[str, tuple[str, str]] = {
+    "arc_challenge": ("arc_challenge_test", "test"),
+    "hellaswag": ("hellaswag_test", "validation"),
+    "mmlu": ("mmlu_test", "test"),  # the pinned "all" config includes every subject
+    "winogrande": ("winogrande_test", "validation"),
+}
+BLOOM_ADAPTER_VERSION = "complete-choice-label-text-v1"
+
+
+def bloom_benchmark_names(names: list[str]) -> list[str]:
+    """Validate even direct Python configs; sort/deduplicate an unordered selection."""
+    if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+        raise ValueError("bloom_deduplicate_across_sources_add_benchmarks must be a list of strings")
+    unknown = sorted(set(names) - BLOOM_BENCHMARKS.keys())
+    if unknown:
+        raise ValueError(f"unknown Bloom benchmark(s) {unknown}; known: {sorted(BLOOM_BENCHMARKS)}")
+    return sorted(set(names))
+
+
+def bloom_benchmark_policy(names: list[str]) -> dict[str, Any]:
+    """Static, pinned identity; does not import datasets or read benchmark material."""
+    return {
+        "adapter_version": BLOOM_ADAPTER_VERSION,
+        "sets": [
+            {"name": name, "hf_id": BENCHMARKS[registry].hf_id,
+             "config": BENCHMARKS[registry].config, "split": split,
+             "revision": BENCHMARKS[registry].revision}
+            for name in bloom_benchmark_names(names)
+            for registry, split in [BLOOM_BENCHMARKS[name]]
+        ],
+    }

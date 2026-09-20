@@ -40,6 +40,9 @@ def stub_lm_eval(monkeypatch: pytest.MonkeyPatch, error: Exception | None = None
     A fake `lm_eval` package in `sys.modules` recording the `HFLM` and `simple_evaluate` arguments.
     """
 
+    import evaluation.benchmark_model  # noqa: F401
+    import torch
+
     calls: dict[str, Any] = {}
     package = types.ModuleType("lm_eval")
     models = types.ModuleType("lm_eval.models")
@@ -48,6 +51,8 @@ def stub_lm_eval(monkeypatch: pytest.MonkeyPatch, error: Exception | None = None
     class HFLM:
         def __init__(self, **kwargs: Any) -> None:
             calls["hflm"] = kwargs
+            self.rank, self.world_size = 0, 1
+            self.device = torch.device("cpu")
 
     def simple_evaluate(**kwargs: Any) -> dict[str, Any]:
         calls["evaluate"] = kwargs
@@ -99,13 +104,19 @@ def test_evaluate_on_benchmarks_runs_the_harness_on_the_wrapper(
     assert calls["evaluate"]["tasks"] == ["arc_easy", "hellaswag"]
     assert (calls["evaluate"]["num_fewshot"], calls["evaluate"]["limit"]) == (2, 40)
     assert calls["evaluate"]["model"].__class__.__name__ == "HFLM"
-    # lm-eval reseeds torch on every call, so the seed of the isolated inference only reaches it as an argument
-    assert calls["evaluate"]["torch_random_seed"] == 5
+    # The adapter seeds Torch after HFLM construction and disables the harness all-device reseed.
+    assert calls["evaluate"]["torch_random_seed"] is None
+    assert calls["evaluate"]["random_seed"] == 0
+    assert calls["evaluate"]["numpy_random_seed"] == calls["evaluate"]["fewshot_random_seed"] == 1234
     assert calls["evaluate"]["log_samples"] is False and calls["evaluate"]["bootstrap_iters"] == BOOTSTRAP_ITERS
     record = json.loads(path.read_text(encoding="utf-8"))
     assert path == tmp_path / "benchmarks" / "step-00000007.json"
     assert (record["step"], record["tasks"], record["limit"], record["num_fewshot"]) == (7, ["arc_easy", "hellaswag"], 40, 2)
     assert record["seed"] == 5
+    assert record["rng_seeds"] == {
+        "random_seed": 0, "numpy_random_seed": 1234, "torch_random_seed": 5, "fewshot_random_seed": 1234,
+    }
+    assert record["torch_seed_owner"] == "evaluation_cpu_model_device"
     assert record["recurrences"] == [None, [2, 2]] and record["metrics"] == metrics
     assert record["results"] == {"mean": RESULTS, "2-2": RESULTS} and record["versions"] == {"arc_easy": 1, "hellaswag": 1}
 
@@ -122,7 +133,7 @@ def test_num_fewshot_default_leaves_every_task_at_its_own(
     evaluate_on_benchmarks(tiny_model, tokenizer, ["arc_easy"])
     assert calls["evaluate"]["num_fewshot"] is None
     evaluate_on_benchmarks(tiny_model, tokenizer, ["arc_easy"], num_fewshot=0)
-    assert calls["evaluate"]["num_fewshot"] == 0
+    assert calls["evaluate"].get("num_fewshot") == 0
     with pytest.raises(ValueError, match="num_fewshot must be >= -1"):
         evaluate_on_benchmarks(tiny_model, tokenizer, ["arc_easy"], num_fewshot=-2)
 
@@ -136,7 +147,9 @@ def test_default_tasks_are_the_settings_default() -> None:
     from training.settings import DEFAULT_BENCHMARK_TASKS, Settings
 
     assert DEFAULT_TASKS is DEFAULT_BENCHMARK_TASKS
-    assert list(DEFAULT_TASKS) == Settings.__dataclass_fields__["benchmark_tasks"].default_factory()
+    factory = Settings.__dataclass_fields__["benchmark_tasks"].default_factory
+    assert callable(factory)
+    assert list(DEFAULT_TASKS) == factory()
 
 
 def test_evaluate_on_benchmarks_errors(
@@ -166,7 +179,7 @@ def test_real_harness_encodes_contexts_with_bos(tiny_model: RecurrentGPT, tiny_t
     here, instead of quietly costing every benchmark the few points a missing BOS costs.
     """
 
-    pytest.importorskip("lm_eval", reason="needs the eval extra (uv sync --extra eval)")
+    pytest.importorskip("lm_eval", reason="needs lm_eval (uv sync)")
     # Not an importorskip: with lm_eval installed, an `lm_eval.models.huggingface` that will not import (a missing
     # accelerate) is the state this test is here to catch, because a benchmark run dies on the same import.
     # `Any`: lm_eval ships no stubs for the HFLM constructor, and the assertions below are about its behaviour
@@ -185,10 +198,132 @@ def test_real_harness_encodes_contexts_with_bos(tiny_model: RecurrentGPT, tiny_t
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(not os.environ.get("RUN_BENCHMARK_TESTS"), reason="set RUN_BENCHMARK_TESTS=1 (needs the eval extra and network)")
+@pytest.mark.skipif(not os.environ.get("RUN_BENCHMARK_TESTS"), reason="set RUN_BENCHMARK_TESTS=1 (needs lm_eval and network)")
 def test_real_harness_scores_arc_easy(tiny_model: RecurrentGPT, tiny_tokenizer_dir: Path, tmp_path: Path) -> None:
     pytest.importorskip("lm_eval")
     metrics = evaluate_on_benchmarks(
         tiny_model, Tokenizer(tiny_tokenizer_dir), ["arc_easy"], limit=4, batch_size=2, out_path=benchmarks_path(tmp_path, 1)
     )
     assert "benchmark/mean/arc_easy/acc" in metrics and 0.0 <= metrics["benchmark/mean/arc_easy/acc"] <= 1.0
+
+
+def test_harness_without_seed_arguments_fails_explicitly(
+    tiny_model: RecurrentGPT, tiny_tokenizer_dir: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub_lm_eval(monkeypatch)
+
+    def incompatible(model: object, tasks: object) -> None:
+        pytest.fail("unsupported harness must be rejected before evaluation")
+
+    monkeypatch.setattr(sys.modules["lm_eval"], "simple_evaluate", incompatible)
+    with pytest.raises(RuntimeError, match="lacks required RNG seed arguments.*torch_random_seed"):
+        evaluate_on_benchmarks(tiny_model, Tokenizer(tiny_tokenizer_dir), ["offline"])
+
+
+def test_metadata_marks_unavailable_harness_settings(
+    tiny_model: RecurrentGPT, tiny_tokenizer_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub_lm_eval(monkeypatch)
+    path = tmp_path / "result.json"
+    evaluate_on_benchmarks(tiny_model, Tokenizer(tiny_tokenizer_dir), ["offline"], batch_size="auto:2", out_path=path)
+    record = json.loads(path.read_text())["execution_metadata"]
+    assert record["schema_version"] == 1
+    settings = record["recurrences"]["mean"]
+    assert settings["batching"]["requested"] == "auto:2"
+    assert settings["batching"]["configured"] == {"value": None, "source": "unavailable"}
+    assert settings["scoring_cache"]["response_cache_enabled"] == {"value": None, "source": "unavailable"}
+    assert settings["precision"]["requested_policy"] is None
+    assert settings["precision"]["hflm_mixed_precision_dtype"]["source"] == "unavailable"
+    assert settings["generation"]["effective_per_request_use_cache"]["source"] == "unavailable"
+    assert record["dependencies"]["triton"]["status"] == "not_applicable"
+
+
+def test_metadata_reads_post_harness_automatic_selection_without_leaking_cache_paths(
+    tiny_model: RecurrentGPT, tiny_tokenizer_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch
+    from model.execution import ExecutionPolicy
+
+    stub_lm_eval(monkeypatch)
+    count = 0
+
+    def simple_evaluate(**kwargs: Any) -> dict[str, Any]:
+        nonlocal count
+        count += 1
+        lm = kwargs["model"]
+        lm.batch_size = "auto"
+        lm.batch_sizes = {0: count + 1, 1: count + 2}
+        lm.max_batch_size = 64
+        lm.mixed_precision_dtype = torch.bfloat16
+        lm.softmax_dtype = None
+        lm.max_length = 99
+        lm.logits_cache = False
+        return {"results": RESULTS, "config": {"use_cache": "/private/account/cache.db", "batch_sizes": [count + 1]}}
+
+    monkeypatch.setattr(sys.modules["lm_eval"], "simple_evaluate", simple_evaluate)
+    path = tmp_path / "result.json"
+    evaluate_on_benchmarks(tiny_model, Tokenizer(tiny_tokenizer_dir), ["offline"], batch_size="auto", out_path=path,
+                           recurrences=[None, [1, 1]], execution_policy=ExecutionPolicy("bf16-mixed"))
+    text = path.read_text()
+    assert "/private" not in text
+    record = json.loads(text)
+    assert record["execution_precision"] == "bf16-mixed"
+    settings = record["execution_metadata"]["recurrences"]
+    for label, first in (("mean", 2), ("1-1", 3)):
+        metadata = settings[label]
+        assert metadata["batching"]["automatic_schedule"]["value"] == {"0": first, "1": first + 1}
+        assert metadata["batching"]["harness_reported_batch_sizes"] == [first]
+        assert metadata["precision"]["hflm_mixed_precision_dtype"]["value"] == "torch.bfloat16"
+        assert metadata["precision"]["hflm_softmax_dtype"] == {"value": None, "source": "hflm.softmax_dtype"}
+        assert metadata["context"]["effective_cap"]["value"] == 99
+        assert metadata["scoring_cache"]["response_cache_enabled"]["value"] is True
+        assert metadata["scoring_cache"]["logits_cache"]["value"] is False
+
+
+def test_real_local_hflm_metadata(
+    tiny_model: RecurrentGPT, tiny_tokenizer_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("lm_eval")
+    huggingface: Any = importlib.import_module("lm_eval.models.huggingface")
+    from evaluation.benchmarks import _import_lm_eval
+    from model.execution import ExecutionPolicy
+    package, _ = _import_lm_eval()
+    original = package.simple_evaluate
+
+    # Retain the real default invocation signature, but do no task/dataset loading.
+    import functools
+
+    @functools.wraps(original)
+    def local_evaluate(**kwargs: Any) -> dict[str, Any]:
+        assert isinstance(kwargs["model"], huggingface.HFLM)
+        return {"results": RESULTS}
+
+    monkeypatch.setattr(package, "simple_evaluate", local_evaluate)
+    path = tmp_path / "result.json"
+    evaluate_on_benchmarks(tiny_model, Tokenizer(tiny_tokenizer_dir), ["offline"], batch_size=2, out_path=path,
+                           execution_policy=ExecutionPolicy("bf16-mixed"))
+    record = json.loads(path.read_text())["execution_metadata"]
+    metadata = record["recurrences"]["mean"]
+    assert metadata["batching"]["configured"] == {"value": 2, "source": "hflm.batch_size"}
+    assert metadata["precision"]["hflm_mixed_precision_dtype"]["value"] == "torch.bfloat16"
+    assert metadata["precision"]["session_autocast_enabled"] is True
+    assert metadata["context"]["effective_cap"]["value"] == tiny_model.config.model_max_sequence_length
+    assert metadata["scoring_cache"]["logits_cache"]["value"] is True
+    assert metadata["scoring_cache"]["response_cache_enabled"] == {
+        "value": False, "source": "simple_evaluate.signature_default",
+    }
+    assert metadata["scoring_cache"]["cache_requests"]["value"] is False
+    assert metadata["generation"]["wrapper_generation_config_use_cache"] is None  # current local HF config leaves it unset
+    for package_name in ("torch", "transformers", "lm_eval"):
+        assert record["dependencies"][package_name]["version"]
+
+
+def test_dependency_metadata_does_not_import_optional_packages(monkeypatch: pytest.MonkeyPatch) -> None:
+    from evaluation.metadata import dependency_versions
+
+    monkeypatch.delitem(sys.modules, "triton", raising=False)
+    monkeypatch.delitem(sys.modules, "lm_eval", raising=False)
+    dependencies = dependency_versions(custom_kernels=True)
+    assert dependencies["triton"] == {"version": None, "status": "not_loaded"}
+    assert dependencies["lm_eval"] == {"version": None, "status": "not_loaded"}
+    assert "triton" not in sys.modules and "lm_eval" not in sys.modules

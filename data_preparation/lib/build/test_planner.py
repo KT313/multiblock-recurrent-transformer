@@ -17,14 +17,14 @@ import pytest
 
 from data_preparation.lib.build.repair import ConfirmationRequired, RepairError
 
-from data_preparation.dataset_config import (
+from data_preparation.lib.dataset_config import (
     DatasetConfig,
     ProcessingConfig,
     SourceConfig,
     StageConfig,
     TokenizerConfig,
 )
-from data_preparation.layout import DatasetLayout
+from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.build.runner import prepare, status
 from data_preparation.lib.build.planner import (
     DatasetReport,
@@ -70,6 +70,7 @@ def two_stage_cfg(tokens_a: int = 6400, tokens_b: int = 3200, rows_h: int = 8, t
         training_target_sequence_length=training_target_sequence_length,
         dataset_max_sequence_length=128,
         processing=ProcessingConfig(min_chars=min_chars),
+        bloom_deduplicate_across_sources=False,
     )
 
 
@@ -254,6 +255,10 @@ def test_an_unreadable_raw_manifest_is_a_reported_state_not_a_crash(layout: Data
     path = config_file(cfg)
     prepare(path, layout.root, assume_yes=False)
     (layout.raw_dir("b") / "MANIFEST.json").write_text("{ not json")
+    processed = Manifest.load(layout.processed_dir("b"))
+    assert processed is not None
+    processed.generation_complete = False
+    processed.save(layout.processed_dir("b"))  # unfinished output still cannot build without current raw input
     reason = "raw unreadable manifest next to shards; fix or delete the directory by hand"
 
     b = source_ledger(cfg, "b", layout)
@@ -572,7 +577,8 @@ def test_report_table_and_missing(layout: DatasetLayout, config_file: ConfigFile
     lines = report.table().splitlines()
     assert lines[0].split() == ["source", "kind", "needed", "tokens/row", "raw", "processed", "epochs", "state", "reason"]
     assert lines[1].split() == ["a", "pretrain", "127", "64", "0", "0", "-", "incomplete", "raw", "missing"]
-    assert lines[-1].split() == ["tokenizer", "tokenizer", "incomplete"]
+    assert lines[-1].split()[:3] == ["tokenizer", "tokenizer", "incomplete"]
+    assert "missing or unreadable tokenizer manifest" in lines[-1] and "run prepare" in lines[-1]
     prepare(config_file(cfg), layout.root, assume_yes=False)
     complete = summarize_dataset_state(cfg, layout)
     assert complete.complete and complete.unsatisfied() == []

@@ -19,8 +19,9 @@ rows in file order. How a file is fetched depends on its size (known from the in
 A :class:`FileIndex` per (repo, revision, glob) remembers the file list and sizes (one batched
 HfApi.get_paths_info call), the row count of every file read so far and the row-group row counts of every
 parquet footer seen, so a fetch at offset skips whole files without opening them. It records the commit the
-file list was taken at; an index loaded from disk is only valid while the repo still resolves to that commit (a
-moved repo is a hard error: offsets counted against the old listing would skip or duplicate rows). It is
+file list was taken at and uses that immutable commit for every size and payload read. An index loaded from
+disk is only valid while the repo still resolves to that commit (a moved repo is a hard error: offsets counted
+against the old listing would skip or duplicate rows). It is
 persisted as JSON under <index_dir>/<repo>@<revision>/<glob hash>.json when an index_dir is given, else
 kept in memory. Per-key counters (keyed_counts[key][file], group_counts[key][file], e.g. rows of one language
 for github_code) share the index.
@@ -50,7 +51,6 @@ from __future__ import annotations
 
 import gzip
 import hashlib
-import functools
 import io
 import itertools
 import json
@@ -61,11 +61,17 @@ from collections.abc import Callable, Generator, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, BinaryIO, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, cast
+
+from data_preparation.lib.download_profile import active_profile, bind_profile, measure, measured
 
 import pyarrow.parquet as pq
 
 from data_preparation.lib.storage.atomic import write_atomically
+from data_preparation.lib.sources.prefetch import PrefetchReader
+
+if TYPE_CHECKING:
+    import httpx
 
 Row = dict[str, Any]
 RowBatch = list[Row]
@@ -90,21 +96,40 @@ INDEX_SAVE_INTERVAL_SECONDS = 30.0  # how often at most a persisted FileIndex is
 HUB_REQUEST_TIMEOUT = 30.0  # seconds to connect, and between two reads, of any Hub request (listing, sizes, downloads)
 
 
-@functools.cache
+_HUB_HTTP_LOCK = threading.Lock()
+_HUB_HTTP_CONFIGURED = False
+
+
+def _hub_client_factory() -> httpx.Client:
+    # Reuse the dependency's default factory: preserve its request hook (offline mode, request IDs),
+    # redirects, default transport and environment proxy/certificate settings on every recreation.
+    from huggingface_hub.utils._http import default_client_factory
+
+    client = default_client_factory()
+    client.timeout = HUB_REQUEST_TIMEOUT
+    return client
+
+
 def configure_hub_http() -> None:
     """
-    Bound every request of huggingface_hub's shared HTTP client by :data:`HUB_REQUEST_TIMEOUT` (once per process).
-    The library passes its own, shorter timeouts to range reads and cache downloads; the size lookup
-    (HfApi.get_paths_info) relies on the client's, which is unset by default. The repo listing
-    (:func:`repo_listing`) gets the timeout as an explicit argument instead: HfApi.dataset_info passes its own
-    default timeout=None down to the client, and an explicit None disables the client's timeout in httpx.
+    Register a timeout-owning factory for every shared Hub client, including connection-error retries.
+
+    Installation is serialized across source jobs: functools.cache allows overlapping first calls, and a
+    second factory registration would close the client another job just started using. The factory itself
+    sets the timeout before the Hub publishes each client. Explicit per-request timeouts still take priority;
+    dataset_info therefore needs its explicit timeout because its default None disables the client's.
     """
 
-    from huggingface_hub import get_session
+    from huggingface_hub import set_client_factory
 
-    get_session().timeout = HUB_REQUEST_TIMEOUT
+    global _HUB_HTTP_CONFIGURED
+    with _HUB_HTTP_LOCK:
+        if not _HUB_HTTP_CONFIGURED:
+            set_client_factory(_hub_client_factory)
+            _HUB_HTTP_CONFIGURED = True
 
 
+@measured("hub_metadata")
 def repo_listing(repo_id: str, revision: str | None, token: str | None) -> tuple[list[str], str]:
     """
     All file paths of a dataset repo at revision plus the commit hash that revision resolved to.
@@ -117,11 +142,12 @@ def repo_listing(repo_id: str, revision: str | None, token: str | None) -> tuple
 
     configure_hub_http()
     info = HfApi(token=token).dataset_info(repo_id, revision=revision, timeout=HUB_REQUEST_TIMEOUT)
-    if info.sha is None:
+    if not info.sha:
         raise RuntimeError(f"{repo_id}@{revision or 'main'}: the Hub returned no commit hash for the listing")
     return [sibling.rfilename for sibling in info.siblings or []], str(info.sha)
 
 
+@measured("hub_metadata")
 def resolve_revision(repo_id: str, revision: str | None, token: str | None) -> str:
     """
     The commit hash revision currently resolves to (the default branch's head when unset).
@@ -130,6 +156,7 @@ def resolve_revision(repo_id: str, revision: str | None, token: str | None) -> s
     return repo_listing(repo_id, revision, token)[1]
 
 
+@measured("hub_metadata")
 def paths_info(repo_id: str, paths: list[str], revision: str | None, token: str | None) -> dict[str, int]:
     """
     Sizes in bytes of the given repo files (batched HfApi.get_paths_info).
@@ -153,6 +180,7 @@ def paths_info(repo_id: str, paths: list[str], revision: str | None, token: str 
     return sizes
 
 
+@measured("hub_cached_file")
 def hub_download(repo_id: str, filename: str, revision: str | None, token: str | None) -> Path:
     """
     Download one repo file into the Hub cache (no-op if cached) and return its local path.
@@ -285,6 +313,8 @@ class FileIndex:
         """
 
         current = resolve_revision(self.repo_id, self.revision, token)
+        if not current:
+            raise RuntimeError(f"{self.repo_id}@{self.revision or 'main'}: the Hub returned no commit hash")
         if self.resolved_revision is None:
             self.resolved_revision = current  # one-time upgrade of a pre-recording index; persisted by open()'s save
             return
@@ -317,6 +347,22 @@ class FileIndex:
             raise FileNotFoundError(f"{repo_id}@{revision or 'main'}: no files match data_files={pattern!r}")
         return cls(repo_id, revision, pattern, files, resolved_revision=resolved, path=path)
 
+    @property
+    def read_revision(self) -> str:
+        """
+        Immutable identity for every metadata/payload read in this active index.
+
+        Only open() may establish identity (including the legacy upgrade and resume check). Never resolve
+        here: a moving branch must not change the snapshot partway through an indexed reading session.
+        """
+
+        if not self.resolved_revision:
+            raise RuntimeError(
+                f"{self.repo_id}@{self.revision or 'main'}: the file index has no resolved commit; "
+                "reopen it with FileIndex.open() to resolve and record its identity before reading Hub files."
+            )
+        return self.resolved_revision
+
     def ensure_sizes(self, token: str | None) -> None:
         """
         Fetch the sizes of files not yet in the index (one batched call; indexes written before sizes existed).
@@ -324,7 +370,7 @@ class FileIndex:
 
         missing = [file for file in self.files if file not in self.sizes]
         if missing:
-            sizes = paths_info(self.repo_id, missing, self.revision, token)
+            sizes = paths_info(self.repo_id, missing, self.read_revision, token)
             with self._lock:
                 self.sizes.update(sizes)
 
@@ -549,9 +595,20 @@ class _CountingRaw(io.RawIOBase, BinaryIO):
         super().__init__()
         self._inner = inner
         self._stats = stats
+        # Capture the handle, not self: a stored bound method would form a buffer-retaining cycle.
+        def read_inner(size: int) -> bytes:
+            with measure("remote_read"):
+                data = inner.read(size)
+            profile = active_profile()
+            if profile is not None:
+                profile.record("remote_returned_bytes", 0, amount=len(data))
+                profile.record("remote_requested_bytes", 0, amount=max(0, size))
+            return data
+
+        self._read = inner.read if active_profile() is None else bind_profile(read_inner)  # Arrow can enter from a native IO thread
 
     def readinto(self, buffer: Any) -> int:
-        data = self._inner.read(len(buffer))
+        data = self._read(len(buffer))
         bytes_read = len(data)
         buffer[:bytes_read] = data
         self._stats.bytes_fetched += bytes_read
@@ -592,6 +649,7 @@ class HubFetcher:
     remote: OpenRemote | None = None
     stats: FetchStats = field(default_factory=FetchStats)
     created: float = field(default_factory=time.time)  # a cache file younger than this was downloaded by this fetcher
+    prefetch_bytes: int = 0
 
     def uses_cache(self, size: int) -> bool:
         """
@@ -616,7 +674,7 @@ class HubFetcher:
     @contextmanager
     def _open_cached(self, index: FileIndex, file: str) -> Iterator[BinaryIO]:
         download = self.download or hub_download
-        path = download(index.repo_id, file, index.revision, self.token)
+        path = download(index.repo_id, file, index.read_revision, self.token)
         self.stats.files_downloaded += 1
         status = path.stat()
         if status.st_mtime >= self.created:  # downloaded now, not found in the cache: its bytes were fetched
@@ -628,17 +686,24 @@ class HubFetcher:
     def _open_remote(self, index: FileIndex, file: str, fmt: str) -> Iterator[BinaryIO]:
         open_file = self.remote or open_remote
         block_size = PARQUET_BLOCK_SIZE if fmt == ".parquet" else STREAM_BLOCK_SIZE
-        raw = open_file(index.repo_id, file, index.revision, self.token, block_size)
+        raw = open_file(index.repo_id, file, index.read_revision, self.token, block_size)
         self.stats.files_streamed += 1
-        counting = _CountingRaw(raw, self.stats)
-        if fmt == ".parquet":
-            # random access: pyarrow reads exact column-chunk ranges itself, no extra buffering wanted
-            with counting:
-                yield counting
+        counting: _CountingRaw | PrefetchReader = _CountingRaw(raw, self.stats)
+        if self.prefetch_bytes:
+            counting = PrefetchReader(counting, index.sizes[file], self.prefetch_bytes)
+        stream = counting if fmt == ".parquet" else io.BufferedReader(counting, buffer_size=STREAM_BUFFER_SIZE)
+        try:
+            yield stream
+        except BaseException as error:
+            try:
+                stream.close()
+            except Exception as cleanup_error:
+                if isinstance(error, GeneratorExit):
+                    raise  # an early consumer stop must still report a failed background request
+                error.add_note(f"Remote reader cleanup also failed: {cleanup_error!r}")
+            raise
         else:
-            # sequential decoding (json lines / ijson): read through a local buffer
-            with io.BufferedReader(counting, buffer_size=STREAM_BUFFER_SIZE) as buffered:
-                yield buffered
+            stream.close()
 
 
 # --- per-format readers -----------------------------------------------------------------------------------------------
@@ -721,8 +786,16 @@ def row_group_batches(parquet: pq.ParquetFile, group: int, columns: list[str] | 
     their order are exactly those of the row group; a consumer that stops early leaves the rest undecoded.
     """
 
-    for batch in parquet.iter_batches(batch_size=batch_size, columns=columns, row_groups=[group]):
-        yield batch.to_pylist()
+    batches = parquet.iter_batches(batch_size=batch_size, columns=columns, row_groups=[group])
+    while True:
+        with measure("parquet_next_batch"):
+            try:
+                batch = next(batches)
+            except StopIteration:
+                return
+        with measure("arrow_to_python"):
+            rows = batch.to_pylist()
+        yield rows
 
 
 def project_row(row: Row, columns: list[str] | None) -> Row:

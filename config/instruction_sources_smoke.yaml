@@ -1,0 +1,25 @@
+# Tiny native model for checking the role-token pipeline; dataset acquisition still requires HF access.
+# Functional smoke test, not a throughput benchmark.
+run_name: instruction_sources_smoke
+out_dir: outputs
+resume: false
+model_architecture_config: config/model_architecture/tiny.yaml
+model_overwrite: {vocab_size: 32002, padded_vocab_size: 32768, model_max_sequence_length: 4096}
+dataset_config: config/datasets/instruction_sources_smoke.yaml
+dataset_dir: dataset
+auto_prepare: false
+training_max_sequence_length: 4096
+stage_base_lrs: [3e-4, 1e-4, 5e-5]
+backend: single_device
+precision: bf16-mixed
+use_custom_kernels: false
+compile_model: false
+tokens_per_micro_batch: 4096
+micro_batches_per_step: 2
+validation_batch_size: 1
+warmup_steps: 0
+cooldown_steps: 0
+sample_at_training_progress: []
+benchmark_at_training_progress: []
+benchmark_apply_chat_template: false
+wandb_enabled: false

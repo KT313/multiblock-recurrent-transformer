@@ -30,18 +30,43 @@ class RMSNorm(torch.nn.Module):
         The normalization without the learned weight.
         """
 
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return rms_normalize(x, self.eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Statistics in float32 (autocast off: a half-precision `x^2` would underflow), cast back, then the weight.
-        # The op order is part of the reference numerics.
-        device_type = x.device.type
-        round_to = self.autocast_output and torch.is_autocast_enabled(device_type)  # read before autocast is turned off
-        with torch.autocast(enabled=False, device_type=device_type):
-            if round_to:
-                # The bf16 residual stream: normalization and weight in fp32, one rounding to the autocast dtype.
-                return (self._norm(x.float()) * self.weight).to(torch.get_autocast_dtype(device_type))
-            return self._norm(x.float()).type_as(x) * self.weight
+        return rms_norm(x, self.weight, self.eps, self.autocast_output)
+
+    def residual(self, branch: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        """Apply this norm after a residual addition, through the shared functional operation."""
+        return residual_norm(self, branch, residual)
 
     def reset_parameters(self) -> None:
         torch.nn.init.ones_(self.weight)
+
+
+def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float, autocast_output: bool = False) -> torch.Tensor:
+    """
+    Functional RMSNorm, including the residual-stream rounding contract. Kernel experiments replace this operation.
+    """
+
+    device_type = x.device.type
+    round_to = autocast_output and torch.is_autocast_enabled(device_type)
+    with torch.autocast(enabled=False, device_type=device_type):
+        value = x.float()
+        normalized = rms_normalize(value, eps)
+        if round_to:
+            return (normalized * weight).to(torch.get_autocast_dtype(device_type))
+        return normalized.type_as(x) * weight
+
+
+def residual_norm(norm: RMSNorm, branch: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+    """
+    The sandwich post-norm: add the branch to the residual, then apply the original norm module.
+    """
+
+    result: torch.Tensor = norm(branch + residual)
+    return result
+
+
+def rms_normalize(x: torch.Tensor, eps: float) -> torch.Tensor:
+    """Normalize in the supplied dtype. The weighted operation selects fp32 before calling this."""
+    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)

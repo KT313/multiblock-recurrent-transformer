@@ -86,7 +86,7 @@ def test_check_recurrence_rejects_a_wrong_block_count(tiny_model: RecurrentGPT) 
 
 
 def test_default_prompts() -> None:
-    assert instruction_prompt("Translate.", "  Hallo  ") == Prompt("Translate.\n\nHallo\n\n", INSTRUCTION)
+    assert instruction_prompt("Translate.", "  Hallo  ") == Prompt("Translate.\n\nHallo\n\n", INSTRUCTION, messages=[{"role": "user", "content": "Translate.\n\nHallo"}])
     assert all(p.kind in (CONTINUATION, INSTRUCTION) for p in DEFAULT_PROMPTS)
     assert all(p.text.endswith("\n\n") for p in DEFAULT_PROMPTS if p.kind == INSTRUCTION)
     assert load_prompts() == list(DEFAULT_PROMPTS)
@@ -98,7 +98,7 @@ def test_prompts_file(tmp_path: Path) -> None:
     prompts = load_prompts_file(path)
     assert prompts == [
         Prompt("Once upon a time"),
-        Prompt("Summarize the text.\n\nA long text.\n\n", INSTRUCTION),
+        Prompt("Summarize the text.\n\nA long text.\n\n", INSTRUCTION, messages=[{"role": "user", "content": "Summarize the text.\n\nA long text."}]),
         Prompt("def f():"),
     ]
     assert load_prompts(path) == prompts
@@ -117,7 +117,7 @@ def test_prompts_file_markers_are_matched_exactly(tmp_path: Path) -> None:
     path.write_text("# Compute the primes up to n\ndef primes(n):\n---\n  # Instruction \nSummarize.\n---\n#poem\nRoses")
     assert load_prompts_file(path) == [
         Prompt("# Compute the primes up to n\ndef primes(n):"),
-        Prompt("Summarize.\n\n", INSTRUCTION),
+        Prompt("Summarize.\n\n", INSTRUCTION, messages=[{"role": "user", "content": "Summarize."}]),
         Prompt("#poem\nRoses"),  # not `# instruction` or `# continuation`: content
     ]
     path.write_text("# instruction\n\n")
@@ -208,5 +208,116 @@ def test_generate_and_save_samples_writes_jsonl(tiny_model: RecurrentGPT, tokeni
     assert [line["prompt"] for line in lines] == 2 * [prompt.text for prompt in DEFAULT_PROMPTS]
     assert [line["recurrence"] for line in lines] == len(DEFAULT_PROMPTS) * [[1, 1]] + len(DEFAULT_PROMPTS) * [None]
     assert lines[0]["step"] == 12 and lines[0]["completion"] == samples[0].completion
-    assert lines[0]["decoding"] == {"temperature": 0.0, "max_new_tokens": 4, "seed": 0}
+    assert lines[0]["decoding"] == {
+        "temperature": 0.0, "max_new_tokens": 4, "seed": 0, "batch_size": 3, "use_cache": True,
+        "latent_policy": "fixed_per_token", "latent_rng": "per_core_token_columns_v1", "logits_to_keep": 1,
+    }
     assert set(lines[0]) == {"step", "prompt", "kind", "completion", "new_tokens", "stopped_at_eos", "recurrence", "decoding"}
+
+
+@pytest.mark.parametrize("use_cache", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_sampling_restores_rng_modes_weights_gradients_and_step(
+    tiny_model: RecurrentGPT, tokenizer: Tokenizer, monkeypatch: pytest.MonkeyPatch, use_cache: bool, fail: bool,
+) -> None:
+    from model.hf.modeling import RecurrentGPTForCausalLM
+
+    tiny_model.train()
+    tiny_model.step = 137
+    for parameter in tiny_model.parameters():
+        parameter.grad = torch.ones_like(parameter)
+    snapshots = [(p, id(p), p.data_ptr(), p.clone(), p.grad.clone()) for p in tiny_model.parameters() if p.grad is not None]
+    buffers = [(b, b.data_ptr(), b.clone()) for b in tiny_model.buffers()]
+    monkeypatch.setenv(RECURRENCE_ENV, "9,9")
+    if fail:
+        def failing_generate(self: RecurrentGPTForCausalLM, *args: object, **kwargs: object) -> None:
+            torch.rand(7)
+            raise RuntimeError("injected sampling failure")
+        monkeypatch.setattr(RecurrentGPTForCausalLM, "generate", failing_generate)
+    rng = torch.get_rng_state()
+    if fail:
+        with pytest.raises(RuntimeError, match="injected"):
+            generate_samples(tiny_model, tokenizer, IN_VOCAB_PROMPTS, max_new_tokens=3, use_cache=use_cache)
+    else:
+        generate_samples(tiny_model, tokenizer, IN_VOCAB_PROMPTS, max_new_tokens=3, use_cache=use_cache)
+    assert torch.equal(rng, torch.get_rng_state())
+    assert tiny_model.training and tiny_model.step == 137 and os.environ[RECURRENCE_ENV] == "9,9"
+    assert all(module.training for module in tiny_model.modules())
+    for parameter, identity, pointer, value, grad in snapshots:
+        assert id(parameter) == identity and parameter.data_ptr() == pointer
+        assert torch.equal(parameter, value) and parameter.grad is not None and torch.equal(parameter.grad, grad)
+        assert parameter.dtype == value.dtype and parameter.device == value.device
+    for buffer, pointer, value in buffers:
+        assert buffer.data_ptr() == pointer and torch.equal(buffer, value)
+
+
+def test_legacy_decoding_metadata(tiny_model: RecurrentGPT, tokenizer: Tokenizer, tmp_path: Path) -> None:
+    path = tmp_path / "legacy.jsonl"
+    generate_and_save_samples(
+        tiny_model, tokenizer, path, step=1, prompts=IN_VOCAB_PROMPTS[:1], max_new_tokens=2, use_cache=False,
+    )
+    decoding = json.loads(path.read_text().splitlines()[0])["decoding"]
+    assert decoding["use_cache"] is False and decoding["latent_policy"] == "resample_prefix"
+    assert decoding["logits_to_keep"] == 0
+
+
+@pytest.mark.parametrize("precision", ["32", "bf16-mixed"])
+@pytest.mark.parametrize("use_cache", [False, True])
+def test_sampling_leaves_the_next_training_update_identical(
+    tiny_model: RecurrentGPT, tokenizer: Tokenizer, use_cache: bool, precision: str,
+) -> None:
+    from copy import deepcopy
+    from model.execution import ExecutionPolicy
+
+    policy = ExecutionPolicy(precision)
+
+    plain = deepcopy(tiny_model).train()
+    sampled = deepcopy(tiny_model).train()
+    ids = torch.tensor([[1, 4, 5, 6], [1, 7, 8, 9]])
+    outputs: list[torch.Tensor] = []
+    for model in (plain, sampled):
+        model.step = 11
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+        torch.manual_seed(38)
+        if model is sampled:
+            generate_samples(model, tokenizer, IN_VOCAB_PROMPTS[:2], max_new_tokens=3, use_cache=use_cache,
+                             execution_policy=policy)
+        with policy.autocast("cpu"):
+            loss = model(ids, labels=ids)["loss"]
+        assert loss is not None
+        loss.backward()
+        optimizer.step()
+        outputs.append(loss.detach())
+    assert torch.equal(outputs[0], outputs[1])
+    for left, right in zip(plain.parameters(), sampled.parameters()):
+        assert torch.equal(left, right)
+        assert left.grad is not None and right.grad is not None and torch.equal(left.grad, right.grad)
+    assert plain.step == sampled.step == 11 and plain.training and sampled.training
+
+
+@pytest.mark.parametrize("use_cache", [False, True])
+def test_temperature_list_matches_separate_runs(
+    tiny_model: RecurrentGPT, tokenizer: Tokenizer, tmp_path: Path, use_cache: bool,
+) -> None:
+    prompts = IN_VOCAB_PROMPTS[:3]
+    path = tmp_path / "temperatures.jsonl"
+    expected = [sample for temperature in (0.0, 0.7) for recurrence in (None, [1, 1])
+                for sample in generate_samples(tiny_model, tokenizer, prompts, temperature=temperature,
+                    recurrence=recurrence, max_new_tokens=3, batch_size=2, use_cache=use_cache)]
+    rng = torch.get_rng_state()
+    actual = generate_and_save_samples(
+        tiny_model, tokenizer, path, step=1, prompts=prompts, temperature=[0.0, 0.7],
+        recurrences=[None, [1, 1]], max_new_tokens=3, batch_size=2, use_cache=use_cache,
+    )
+    assert actual == expected
+    assert torch.equal(rng, torch.get_rng_state())
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [row["decoding"]["temperature"] for row in rows] == [sample.temperature for sample in expected]
+    assert len(actual) == 4 * len(prompts)
+    combined = generate_samples(tiny_model, tokenizer, prompts, temperature=[0.0, 0.7],
+                                max_new_tokens=3, batch_size=2, use_cache=use_cache)
+    separate = [sample for temperature in (0.0, 0.7) for sample in generate_samples(
+        tiny_model, tokenizer, prompts, temperature=temperature, max_new_tokens=3, batch_size=2, use_cache=use_cache)]
+    assert combined == separate
+    assert generate_samples(tiny_model, tokenizer, prompts, temperature=[0.0], max_new_tokens=3) == generate_samples(
+        tiny_model, tokenizer, prompts, temperature=0.0, max_new_tokens=3)

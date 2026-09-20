@@ -1,0 +1,80 @@
+# Bounded integration mixture, not a research recipe. Use an isolated --dataset_dir.
+# Selects small budgeted prefixes from the pinned pools; check_limit is a row bound, not a network byte bound.
+tokenizer:
+  name: llama-32k-chat-v1
+  profile: llama32k_chat_v1
+  kind: hf
+  hf_id: hf-internal-testing/llama-tokenizer
+  revision: d02ad6cb9dd2c2296a6332199fa2fdca5938fef0
+training_target_sequence_length: 4096
+dataset_max_sequence_length: 8192
+token_count: tokenizer
+validation_fraction: 0.05
+always_range_requests: true
+download_prefetch_mb: 0
+bloom_deduplicate_across_sources: true
+bloom_dedup_memory_mb: 8
+processing:
+  min_chars: 50
+  dedup: {mode: exact, normalize: true, bloom_memory_mb: 8}
+  quality_filter: false
+  decontamination: {enabled: false}
+sources:
+  fineweb_edu_350bt_smoke:
+    kind: pretrain
+    loader: hf_files
+    hf_id: HuggingFaceFW/fineweb-edu
+    revision: 87f09149ef4734204d70ed1d046ddc9ca3f2b8f9
+    load_kwargs: {data_files: "sample/350BT/*.parquet"}
+    check_limit: 5000
+    describe_tokens_per_row: 1000  # startup estimate only
+  opencodeinstruct_smoke:
+    kind: instruct
+    instruction_format: messages
+    loader: hf_files
+    hf_id: nvidia/OpenCodeInstruct
+    revision: 8f3ba5bafe4d6e8db46082cf7ae6741bc370604d
+    load_kwargs: {data_files: "data/train-*.parquet"}
+    converter: opencode_messages
+    filter: opencode_passed_tests
+    input_inversions: 0
+    check_limit: 5000
+    describe_tokens_per_row: 1000
+  webinstruct_verified_smoke:
+    kind: instruct
+    instruction_format: messages
+    loader: hf_files
+    hf_id: TIGER-Lab/WebInstruct-verified
+    revision: 3e8a350b3a935d68fe70bdf379692500abc9ff51
+    load_kwargs: {data_files: "data/train-*.parquet"}  # excludes test and train_legacy
+    converter: webinstruct_messages
+    input_inversions: 0
+    check_limit: 5000
+    describe_tokens_per_row: 100
+  nemotron_chat_off_smoke:
+    kind: instruct
+    instruction_format: messages
+    loader: hf_files
+    hf_id: nvidia/Nemotron-SFT-Instruction-Following-Chat-v2
+    revision: 1a9454ed054b8544503ab8d8c0a519d141a44c5b
+    load_kwargs: {data_files: "data/reasoning_off.jsonl"}
+    converter: nemotron_messages
+    input_inversions: 0
+    check_limit: 5000
+    describe_tokens_per_row: 1500
+stages:
+  - name: pretrain_phase1
+    tokens: 131072
+    transition_pct: 0.10
+    train: {fineweb_edu_350bt_smoke: 1.0}
+    val: {fineweb_edu_350bt_smoke: 1.0}
+  - name: pretrain_phase2
+    tokens: 131072
+    transition_pct: 0.10
+    train: {fineweb_edu_350bt_smoke: 0.5, opencodeinstruct_smoke: 0.5}
+    val: {fineweb_edu_350bt_smoke: 0.5, opencodeinstruct_smoke: 0.5}
+  - name: finetune
+    tokens: 262144
+    transition_pct: 0
+    train: {opencodeinstruct_smoke: 0.3, webinstruct_verified_smoke: 0.3, nemotron_chat_off_smoke: 0.4}
+    val: {opencodeinstruct_smoke: 0.3, webinstruct_verified_smoke: 0.3, nemotron_chat_off_smoke: 0.4}

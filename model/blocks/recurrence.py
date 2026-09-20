@@ -19,15 +19,18 @@ Calling `torch.utils.checkpoint` from the eager loop *around* the compiled itera
 FlexAttention's forward again: 2.1 times the step time of `none` for the same memory as `full`.
 """
 
+import hashlib
 import math
 from functools import partial
-from typing import Any, Callable, Literal, cast
+from numbers import Integral, Real
+from typing import Any, Callable, Literal, SupportsInt, cast
 
 import torch
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint, create_selective_checkpoint_contexts
 
 from ..layers.attention import AttentionMask
+from ..generation import KVCache
 
 # (num_steps_no_grad, num_steps_with_grad) for one core block.
 StepsPair = tuple[int, int]
@@ -65,18 +68,32 @@ def check_checkpoint_mode(mode: str) -> CheckpointMode:
     return cast(CheckpointMode, mode)
 
 
-def canon_steps(steps: StepsSpec) -> StepsPair:
-    """
-    Turn one `StepsSpec` into an (n, k) pair of plain ints; a missing k means 0.
-    """
+def canon_steps(steps: object) -> StepsPair:
+    """Validate one explicit depth, returning (n no-grad, k backprop) as plain ints.
 
+    Scalars and one-element sequences mean (n, 0); pairs mean (n, k). Tensor shapes are flattened, but must
+    contain exactly one or two elements. Only finite, integral real values are accepted; no truncation occurs.
+    This eager boundary only handles explicit depths, leaving the training sampler and iteration loop untouched.
+    """
+    values: list[object]
     if isinstance(steps, torch.Tensor):
-        values = steps.detach().reshape(-1)
-        pair = (int(values[0].item()), int(values[1].item()) if values.numel() > 1 else 0)
+        if steps.numel() not in (1, 2):
+            raise ValueError(f"num_steps must contain one or two values, got {steps.numel()}")
+        values = steps.detach().reshape(-1).tolist()
     elif isinstance(steps, (list, tuple)):
-        pair = (int(steps[0]), int(steps[1]) if len(steps) > 1 else 0)
+        values = list(steps)
     else:
-        pair = (int(steps), 0)
+        values = [steps]
+    if len(values) not in (1, 2):
+        raise ValueError(f"num_steps must contain one or two values, got {len(values)}")
+    integers: list[int] = []
+    for index, value in enumerate(values):
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise ValueError(f"num_steps[{index}] must be a finite integer-valued real scalar, got {value!r}")
+        if not isinstance(value, Integral) and (not math.isfinite(value) or value % 1 != 0):
+            raise ValueError(f"num_steps[{index}] must be a finite integer-valued real scalar, got {value!r}")
+        integers.append(int(cast(SupportsInt, value)))
+    pair = (integers[0], integers[1] if len(integers) == 2 else 0)
     if min(pair) < 0 or sum(pair) < 1:
         raise ValueError(f"num_steps {steps!r}: a block runs at least one recurrent step (n + k >= 1, both >= 0), else its output is the random initial state")
     return pair
@@ -85,7 +102,8 @@ def canon_steps(steps: StepsSpec) -> StepsPair:
 def normalize_num_steps(num_steps: NumSteps, num_blocks: int) -> list[StepsPair | None]:
     """
     One entry per core block: None (sample per block), one (n_no_grad, k_with_grad) pair broadcast to all blocks,
-    or a list of pairs with one entry per block.
+    or a list of pairs with one entry per block. An outer list always means per-block specifications; a tuple
+    or tensor is broadcast. Each explicit specification is validated by `canon_steps` before recurrence begins.
     """
 
     if num_steps is None:
@@ -108,13 +126,28 @@ def initialize_state(x: Tensor) -> Tensor:
     return torch.randn_like(x)
 
 
+def recurrence_seed(*, step: int, micro_batch_index: int, block_idx: int) -> int:
+    """Stable depth seed for one local microbatch/core, shared across ranks.
+
+    CPU MT19937 initialization uses only 32 seed bits: mix every coordinate into those bits instead of putting
+    fields in high bits. The versioned hash avoids systematic stride aliases, but finite 32-bit seeds can collide.
+    This schedule is independent of the global RNG, rank, world size and accumulation width.
+    """
+    if min(step, micro_batch_index, block_idx) < 0:
+        raise ValueError("recurrence sampling step, micro_batch_index and block_idx must be nonnegative")
+    payload = f"514229:{step}:{micro_batch_index}:{block_idx}".encode("ascii")
+    digest = hashlib.blake2s(payload, digest_size=4, person=b"mbrtdep1").digest()
+    return int.from_bytes(digest, "little")
+
+
 @torch._dynamo.disable(recursive=False)  # type: ignore[no-untyped-call, untyped-decorator]  # torch stub gap
 def sample_recurrence_steps(
-    mean_recurrence: int, mean_backprop_depth: int, *, step: int, block_idx: int, training: bool
+    mean_recurrence: int, mean_backprop_depth: int, *, step: int, block_idx: int, training: bool,
+    micro_batch_index: int = 0,
 ) -> tuple[Tensor, Tensor]:
     """
-    Sample (n no-grad steps, k backprop steps) with the poisson-lognormal-filling scheme, seeded by `step` and
-    `block_idx` (blocks draw independently); in eval mode return (`mean_recurrence`, 0).
+    Sample (n no-grad steps, k backprop steps) with the poisson-lognormal-filling scheme, seeded by optimizer
+    `step`, local `micro_batch_index` and `block_idx`; in eval mode return (`mean_recurrence`, 0).
 
     Outputs are long tensors so that they can be passed through compiled functions.
     """
@@ -129,13 +162,10 @@ def sample_recurrence_steps(
         num_steps_with_grad = torch.as_tensor(0)
         return num_steps_no_grad.to(dtype=torch.long), num_steps_with_grad.to(dtype=torch.long)
 
-    # A private generator seeded by the optimizer step and the block, not the global RNG: a forward re-run under
-    # activation checkpointing draws the same depth again. The block stride is far above any step count, so blocks
-    # never share a seed. The seed has no rank in it on purpose: in distributed training every rank draws the SAME
-    # depth, so every rank's step costs the same and none waits for a deeper one; only the latent noise
-    # (`initialize_state`, the global RNG seeded per rank) differs between ranks.
+    # Replaying the same sampling context reproduces the depth. No rank in the seed: ranks draw the same depth
+    # per local microbatch/core, balancing recurrence work; latent noise still comes from the rank's global RNG.
     generator = torch.Generator(device="cpu")
-    generator.manual_seed((514229 + step + 2**24 * block_idx) % (2**31 - 1))
+    generator.manual_seed(recurrence_seed(step=step, micro_batch_index=micro_batch_index, block_idx=block_idx))
 
     # "poisson-lognormal-filling": total depth = Poisson(rate) + 1, the +1 being the guaranteed pass, with a
     # log-normal rate of mean `mean_recurrence - 1` so the total has mean `mean_recurrence`; the last
@@ -175,6 +205,7 @@ def core_block_forward(
     adapter: torch.nn.Module,
     layers: torch.nn.ModuleList,
     base_proj: Tensor | None = None,
+    caches: list[KVCache] | None = None,
 ) -> Tensor:
     """
     One recurrence iteration: inject the (normalised) block input into the latent state, then run the layers.
@@ -190,8 +221,11 @@ def core_block_forward(
     weight = cast(Tensor, adapter.weight)
     n_embd = weight.shape[0]
     x_latent = torch.nn.functional.linear(x_latent, weight[:, :n_embd]) + base_proj  # (B, S, E)
-    for layer in layers:
-        x_latent = layer(x_latent, freqs_cis, mask)
+    for index, layer in enumerate(layers):
+        if caches is None:
+            x_latent = layer(x_latent, freqs_cis, mask)
+        else:
+            x_latent = layer(x_latent, freqs_cis, mask, caches[index])
     return x_latent
 
 

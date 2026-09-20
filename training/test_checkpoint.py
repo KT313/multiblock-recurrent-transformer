@@ -77,15 +77,38 @@ def _metadata(backend: SingleDeviceBackend, model: RecurrentGPT, step: int = 1, 
 
 def test_metadata_round_trip(backend: SingleDeviceBackend, tiny_model: RecurrentGPT) -> None:
     metadata = _metadata(backend, tiny_model, step=7)
+    metadata.dataset_build_id = "immutable-build"
     state = metadata.to_state()
     assert set(state) == {
         "step", "stage", "world_size", "rng_states", "settings", "model_config", "dataset_config_hash", "validation_rows",
-        "source_rows", "data_stream",
+        "source_rows", "data_stream", "dataset_build_id", "tokenizer_contract",
     }
     assert state["rng_states"] is metadata.rng_states  # a shallow copy: the RNG tensors are not duplicated
     restored = CheckpointMetadata.from_state({"model": {}, "optimizer": {}, **state})  # state dicts are ignored
     assert restored == metadata
     assert restored.step == 7 and restored.settings["seed"] == 42 and restored.model_config["model_max_sequence_length"] == 256
+
+
+def test_pre_sharding_settings_keep_unsharded_resume(backend: SingleDeviceBackend, tiny_model: RecurrentGPT) -> None:
+    metadata = _metadata(backend, tiny_model)
+    del metadata.settings["optimizer_sharding"]
+    check_settings_unchanged(metadata, _settings(run_name="tiny", seed=42), tiny_model.config.to_dict(), False)
+
+
+def test_resume_refuses_sharding_change_before_model_load(
+    backend: SingleDeviceBackend, tiny_model: RecurrentGPT, tmp_path: Path
+) -> None:
+    optimizer = ELLISAdam(get_param_groups(tiny_model, 0.01))
+    metadata = _metadata(backend, tiny_model)
+    metadata.settings["optimizer_sharding"] = "zero1"
+    path = tmp_path / "wrong-mode.pth"
+    save_training_checkpoint(backend, path, tiny_model, optimizer, metadata)
+    before = {name: param.detach().clone() for name, param in tiny_model.named_parameters()}
+    with pytest.raises(ValueError, match="changing optimizer_sharding"):
+        load_training_checkpoint(backend, path, tiny_model, optimizer)
+    assert not optimizer.state
+    for name, param in tiny_model.named_parameters():
+        assert torch.equal(param, before[name])
 
 
 def test_metadata_from_state_missing_key_raises(backend: SingleDeviceBackend, tiny_model: RecurrentGPT) -> None:
@@ -101,6 +124,29 @@ def test_metadata_from_state_missing_key_raises(backend: SingleDeviceBackend, ti
     assert "older version" in str(excinfo.value)
 
 
+def test_metadata_reads_the_single_rank_layout_before_the_multi_rank_fields(
+    backend: SingleDeviceBackend, tiny_model: RecurrentGPT
+) -> None:
+    """
+    The layout right before `world_size` / `rng_states` stored one `rng` dict; it is read as a one-rank checkpoint
+    (every other field is unchanged), so a run started before the multi-GPU support resumes. The legacy key alone
+    does not excuse any other missing field, and it is ignored when the current fields are present.
+    """
+
+    current = _metadata(backend, tiny_model)
+    legacy = current.to_state()
+    legacy["rng"] = legacy.pop("rng_states")[0]
+    del legacy["world_size"]
+    loaded = CheckpointMetadata.from_state(legacy)
+    assert loaded.world_size == 1 and loaded.rng_states == [legacy["rng"]]
+    assert loaded == current
+    del legacy["source_rows"]
+    with pytest.raises(KeyError, match=r"missing the metadata key\(s\) \['source_rows'\]"):
+        CheckpointMetadata.from_state(legacy)
+    both = current.to_state() | {"rng": {"python": "stale"}}
+    assert CheckpointMetadata.from_state(both) == current
+
+
 def test_metadata_field_order_matches_the_documented_layout() -> None:
     assert [f.name for f in fields(CheckpointMetadata)] == [
         "step",
@@ -113,6 +159,8 @@ def test_metadata_field_order_matches_the_documented_layout() -> None:
         "validation_rows",
         "source_rows",
         "data_stream",
+        "dataset_build_id",
+        "tokenizer_contract",
     ]
 
 
@@ -244,17 +292,20 @@ def test_is_checkpoint_step_table() -> None:
 # a constructed `Settings`, not passed to it: `lr_schedule` has exactly one legal value, so no differing schedule
 # survives `Settings.__post_init__`, and what is under test here is the resume comparison, not the value rules.
 CHANGED_COMPARED_VALUES: dict[str, Any] = {
+    "loss_normalization": "legacy_pack_v0",
     "stage_base_lrs": [2e-3],
     "seed": 7,
     "training_max_sequence_length": 128,
     "validation_padding_multiple": 64,
     "precision": "32",
     "compile_model": True,
+    "use_custom_kernels": False,
     "gradient_checkpointing": "full",
     "validation_batch_size": 2,
     "tokens_per_micro_batch": 16384,
     "micro_batches_per_step": 128,
     "optimizer": "AdamW",
+    "optimizer_sharding": "zero1",
     "optim_config": OptimizerConfig(lr=2e-4, weight_decay=4e-5, betas=(0.9, 0.95)),
     "no_weight_decay_for_bias_and_norm_params": False,
     "grad_clip": 0.5,
@@ -313,11 +364,14 @@ def test_check_settings_unchanged_ignores_the_exempt_settings(
 
     metadata = _metadata(backend, tiny_model)
     harmless = _settings(
-        run_name="tiny", seed=42, out_dir="elsewhere", log_step_interval=4, save_step_interval=3,
+        run_name="tiny", seed=42, out_dir="elsewhere", log_step_interval=4, log_gradient_metrics_interval=8, save_step_interval=3,
+        log_correlations='adapter,attention,mlp',
         eval_step_interval=8, eval_iters=3, partial_depth_eval=[2],
         wandb_enabled=False, export_to_hf=True, auto_prepare=False, backend="ddp",  # the world size is compared on its own
         model_architecture_config="moved/elsewhere/tiny.yaml",  # the resolved model config is what gets compared
     )
+    check_settings_unchanged(metadata, harmless, tiny_model.config.to_dict(), False)
+    metadata.settings.pop('log_correlations')  # legacy checkpoints have no detailed-correlation selector
     check_settings_unchanged(metadata, harmless, tiny_model.config.to_dict(), False)
     with pytest.raises(ValueError, match=r"resuming with changed \['model_config'\].*n_embd"):
         check_settings_unchanged(metadata, harmless, {"n_embd": 1}, False)
@@ -390,7 +444,7 @@ def test_save_load_forward_bit_identical(
     assert set(raw) == {"model", "optimizer", *metadata.to_state()}
 
     torch.manual_seed(999)
-    fresh = build_model(TINY_MODEL_ARCHITECTURE)
+    fresh = build_model(TINY_MODEL_ARCHITECTURE, use_custom_kernels=False)
     fresh_opt = ELLISAdam(get_param_groups(fresh, 4e-5), lr=1e-3, betas=(0.9, 0.95))
     restored = load_training_checkpoint(backend, path, fresh, fresh_opt)
     assert restored.step == 1 and restored.stage == 0 and restored.settings["seed"] == 42
@@ -438,7 +492,7 @@ def test_load_of_an_older_layout_fails_before_touching_the_model(
     path = tmp_path / "old.pth"
     state = {"model": tiny_model.state_dict(), "optimizer": opt.state_dict(), "step": 1, "config": {}}
     backend.save_checkpoint(path, state)
-    fresh = build_model(TINY_MODEL_ARCHITECTURE)
+    fresh = build_model(TINY_MODEL_ARCHITECTURE, use_custom_kernels=False)
     before = [p.detach().clone() for p in fresh.parameters()]
     with pytest.raises(KeyError, match="missing the metadata key"):
         load_training_checkpoint(backend, path, fresh, ELLISAdam(get_param_groups(fresh, 4e-5), lr=1e-3))
@@ -460,7 +514,7 @@ def test_compiled_wrapper_is_unwrapped_for_state_dict(
     save_training_checkpoint(backend, path, compiled, opt, _metadata(backend, tiny_model))
     keys = set(backend.load_checkpoint(path)["model"].keys())
     assert keys == set(tiny_model.state_dict().keys())
-    fresh = build_model(TINY_MODEL_ARCHITECTURE)
+    fresh = build_model(TINY_MODEL_ARCHITECTURE, use_custom_kernels=False)
     compiled_fresh = backend.setup_model(fresh, compile_model=True)
     load_training_checkpoint(backend, path, compiled_fresh, ELLISAdam(get_param_groups(fresh, 4e-5), lr=1e-3, betas=(0.9, 0.95)))
     assert all(torch.equal(a, b) for a, b in zip(tiny_model.parameters(), fresh.parameters()))
@@ -478,7 +532,7 @@ def test_load_refuses_changed_optimizer_hyperparameters(
     path = checkpoint_path(tmp_path, "tiny", 1)
     save_training_checkpoint(backend, path, tiny_model, opt, _metadata(backend, tiny_model, step=1))
 
-    fresh = build_model(TINY_MODEL_ARCHITECTURE)
+    fresh = build_model(TINY_MODEL_ARCHITECTURE, use_custom_kernels=False)
     changed = ELLISAdam(get_param_groups(fresh, 0.5), lr=1e-3, betas=(0.8, 0.9))
     with pytest.raises(ValueError, match=r"group 0: betas: checkpoint \(0\.9, 0\.95\) != current \(0\.8, 0\.9\)") as info:
         load_training_checkpoint(backend, path, fresh, changed)
@@ -495,3 +549,111 @@ def test_check_param_groups_unchanged() -> None:
         check_param_groups_unchanged([{}], [{}, {}])
     with pytest.raises(ValueError, match="group 1: eps: checkpoint 1e-08 != current 1e-06"):
         check_param_groups_unchanged([{"eps": 1e-6}, {"eps": 1e-6}], [{"eps": 1e-6}, {"eps": 1e-8}])
+
+
+@pytest.mark.parametrize("legacy_enabled", [False, True])
+def test_old_gradient_logging_flag_does_not_block_resume(
+    backend: SingleDeviceBackend, tiny_model: RecurrentGPT, legacy_enabled: bool,
+) -> None:
+    """
+    Logging settings do not affect training state; older checkpoints need no rewrite for the renamed interval.
+    """
+
+    metadata = _metadata(backend, tiny_model)
+    metadata.settings.pop("log_gradient_metrics_interval")
+    metadata.settings["log_gradient_metrics"] = legacy_enabled
+    for interval in (0, 8):
+        settings = _settings(run_name="tiny", seed=42, log_gradient_metrics_interval=interval)
+        check_settings_unchanged(metadata, settings, tiny_model.config.to_dict(), False)
+
+
+def test_sample_cache_policy_is_compatible_with_old_checkpoint_settings(
+    backend: SingleDeviceBackend, tiny_model: RecurrentGPT,
+) -> None:
+    metadata = _metadata(backend, tiny_model)
+    metadata.settings.pop("sample_use_cache")
+    for policy in (False, True):
+        current = _settings(run_name="tiny", seed=42, sample_use_cache=policy)
+        check_settings_unchanged(metadata, current, tiny_model.config.to_dict(), False)
+
+
+def test_legacy_checkpoint_kernel_flag_means_native(
+    backend: SingleDeviceBackend, tiny_model: RecurrentGPT,
+) -> None:
+    metadata = _metadata(backend, tiny_model)
+    metadata.settings.pop('use_custom_kernels')
+    metadata.model_config.pop('use_custom_kernels')
+    current = _settings(run_name='tiny', seed=42, use_custom_kernels=False)
+    config = tiny_model.config.to_dict() | {'use_custom_kernels': False}
+    check_settings_unchanged(metadata, current, config, False)
+    current.use_custom_kernels = True
+    config['use_custom_kernels'] = True
+    with pytest.raises(ValueError, match='use_custom_kernels'):
+        check_settings_unchanged(metadata, current, config, False)
+    check_settings_unchanged(metadata, current, config, True)
+
+
+def test_legacy_checkpoint_residual_scaling_defaults_to_none(
+    backend: SingleDeviceBackend, tiny_model: RecurrentGPT,
+) -> None:
+    metadata = _metadata(backend, tiny_model)
+    metadata.model_config.pop('residual_scaling')
+    settings = _settings(run_name='tiny', seed=42)
+    config = tiny_model.config.to_dict()
+    check_settings_unchanged(metadata, settings, config, False)
+    with pytest.raises(ValueError, match='residual_scaling'):
+        check_settings_unchanged(metadata, settings, config | {'residual_scaling': 'inverse_sqrt_depth'}, False)
+    assert 'residual_scaling' not in metadata.model_config  # preserve historical metadata
+
+
+def test_legacy_objective_requires_acknowledgement(backend: SingleDeviceBackend, tiny_model: RecurrentGPT,
+                                                  caplog: pytest.LogCaptureFixture) -> None:
+    settings = _settings(run_name="tiny", seed=42)
+    metadata = _metadata(backend, tiny_model)
+    assert metadata.settings.pop("loss_normalization") == "supervised_token_v1"
+    original_rng = metadata.rng_states
+    with pytest.raises(ValueError, match="legacy_pack_v0.*training objective"):
+        check_settings_unchanged(metadata, settings, tiny_model.config.to_dict(), False)
+    check_settings_unchanged(metadata, settings, tiny_model.config.to_dict(), True)
+    assert "Acknowledged loss normalization transition" in caplog.text
+    assert metadata.rng_states is original_rng
+    assert "loss_normalization" not in metadata.settings  # historical provenance is never relabeled
+    with pytest.raises(ValueError, match="legacy pack weighting is unsupported"):
+        _settings(loss_normalization="legacy_pack_v0")
+
+
+def test_legacy_checkpoint_has_unknown_build_identity(backend: SingleDeviceBackend, tiny_model: RecurrentGPT) -> None:
+    state = _metadata(backend, tiny_model).to_state()
+    state.pop("dataset_build_id")
+    assert CheckpointMetadata.from_state(state).dataset_build_id is None
+
+
+@pytest.mark.parametrize(("key", "value"), [("betas", (0.9, 1.0)), ("init_lr", 0.0), ("lr", float("nan"))])
+def test_invalid_optimizer_metadata_fails_before_restore(
+    tmp_path: Path, backend: SingleDeviceBackend, tiny_model: RecurrentGPT, key: str, value: Any
+) -> None:
+    opt, _ = _train_one_step(tiny_model)
+    path = checkpoint_path(tmp_path, "tiny", 1)
+    save_training_checkpoint(backend, path, tiny_model, opt, _metadata(backend, tiny_model))
+    raw = backend.load_checkpoint(path)
+    raw["optimizer"]["param_groups"][0][key] = value
+    torch.save(raw, path)
+    original_group = opt.param_groups[0]
+    with pytest.raises(ValueError, match=key):
+        load_training_checkpoint(backend, path, tiny_model, opt)
+    assert opt.param_groups[0] is original_group
+    saved_value = backend.load_checkpoint(path)["optimizer"]["param_groups"][0][key]
+    assert repr(saved_value) == repr(value)  # rejected checkpoint remains intact
+
+
+def test_sample_batch_size_allows_legacy_checkpoint_resume(backend: SingleDeviceBackend, tiny_model: RecurrentGPT) -> None:
+    metadata = _metadata(backend, tiny_model)
+    metadata.settings.pop("sample_batch_size", None)
+    check_settings_unchanged(metadata, _settings(run_name="tiny", seed=42, sample_batch_size=1), tiny_model.config.to_dict(), False)
+
+
+def test_sample_temperature_list_is_allowed_on_resume(backend: SingleDeviceBackend, tiny_model: RecurrentGPT) -> None:
+    metadata = _metadata(backend, tiny_model)
+    assert metadata.settings["sample_temperature"] == 0.0
+    check_settings_unchanged(metadata, _settings(run_name="tiny", seed=42, sample_temperature=[0.0, 0.7]),
+                             tiny_model.config.to_dict(), False)

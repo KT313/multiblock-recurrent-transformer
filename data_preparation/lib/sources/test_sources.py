@@ -20,7 +20,7 @@ import pyarrow.parquet as pq
 import pytest
 import zstandard
 
-from data_preparation.dataset_config import SourceConfig, SourceKind, load_dataset_config
+from data_preparation.lib.dataset_config import SourceConfig, SourceKind, load_dataset_config
 from data_preparation.lib.sources.converters import (
     CONVERTERS,
     FILTERS,
@@ -33,7 +33,7 @@ from data_preparation.lib.sources.converters import (
     sharegpt_conversations,
     sharegpt_quality,
 )
-from data_preparation.dataset_config import DEFAULT_TOKENS_PER_ROW_ESTIMATE
+from data_preparation.lib.dataset_config import DEFAULT_TOKENS_PER_ROW_ESTIMATE
 from data_preparation.lib.sources.loaders import (
     LOADERS,
     Row,
@@ -307,11 +307,8 @@ def test_sharegpt_conversations() -> None:
         ]
     }
     assert sharegpt_conversations(row) == {"instruction": "hi", "input": "sys", "output": "42"}
-    assert sharegpt_conversations({"conversations": [{"from": "human", "value": "q"}]}) == {
-        "instruction": "q",
-        "input": "",
-        "output": "",
-    }
+    with pytest.raises(ValueError, match="incomplete opening exchange"):
+        sharegpt_conversations({"conversations": [{"from": "human", "value": "q"}]})
     with pytest.raises(ValueError, match="conversations"):
         sharegpt_conversations({"text": "x"})
     with pytest.raises(ValueError, match="from"):
@@ -381,11 +378,10 @@ def test_sharegpt_quality() -> None:
     assert FILTERS["sharegpt_quality"] is get_filter("sharegpt_quality")
     assert not sharegpt_quality(_sharegpt("short", ok_g))
     assert not sharegpt_quality(_sharegpt(ok_h, "g" * 2001))
-    assert not sharegpt_quality(_sharegpt(ok_h, ok_g, first="gpt", second="human"))
     assert not sharegpt_quality(_sharegpt(ok_h, ok_g + "```python\nprint(1)"))
-    assert not sharegpt_quality({"conversations": [{"from": "human", "value": ok_h}]})
-    assert not sharegpt_quality({"conversations": None})
-    assert not sharegpt_quality({})
+    for malformed in ({"conversations": [{"from": "human", "value": ok_h}]}, {"conversations": None}, {}):
+        with pytest.raises(ValueError, match="sharegpt_conversations"):
+            sharegpt_quality(malformed)
 
 
 # --- misc -------------------------------------------------------------------------------------------------------------
@@ -450,3 +446,70 @@ def test_extra_names_reproduce_the_shipped_github_code_source_names() -> None:
     assert len(github) == 10
     for name, source in github.items():
         assert github_code_extra_name(source, str(source.language)) == name
+
+
+@pytest.mark.parametrize("suffix", [
+    [{"from": "human", "value": "unanswered B"}],
+    [{"from": "human", "value": "B"}, {"from": "gpt", "value": "```python bad later answer"}],
+    [{"from": "system", "value": "later context"}, {"from": "human", "value": "B"}],
+])
+def test_sharegpt_selects_only_the_opening_complete_pair(suffix: list[Row]) -> None:
+    from data_preparation.lib.sources.conversations import opening_exchange
+
+    row = _sharegpt("h" * 60, "a" * 60)
+    row["conversations"].extend(suffix)
+    selected = opening_exchange(row)
+    assert (selected.question_index, selected.answer_index) == (0, 1)
+    assert sharegpt_conversations(row) == {"instruction": "h" * 60, "input": "", "output": "a" * 60}
+    assert sharegpt_quality(row)
+    row["conversations"][0]["value"] = "short"
+    assert not sharegpt_quality(row), "a later exchange must not rescue an ineligible opening"
+
+
+def test_sharegpt_initial_system_context_does_not_broaden_filter_eligibility() -> None:
+    from data_preparation.lib.sources.conversations import opening_exchange
+
+    row = _sharegpt("h" * 60, "a" * 60)
+    row["conversations"].insert(0, {"from": "system", "value": "initial context"})
+    row["conversations"].append({"from": "system", "value": "later context"})
+    selected = opening_exchange(row)
+    assert (selected.question_index, selected.answer_index) == (1, 2)
+    assert sharegpt_conversations(row) == {"instruction": "h" * 60, "input": "initial context", "output": "a" * 60}
+    assert not sharegpt_quality(row)
+
+
+@pytest.mark.parametrize("opening, reason", [
+    ([], "incomplete opening"),
+    ([{"from": "gpt", "value": "orphan"}], "must be human"),
+    ([{"from": "human", "value": "q"}, {"from": "human", "value": "q2"}], "must be gpt"),
+    ([{"from": "system", "value": "s"}, {"from": "system", "value": "s2"}], "must be human"),
+    ([{"from": "human"}], "from.*value"),
+    ([{"value": "q"}], "from.*value"),
+    ([{"from": [], "value": "q"}], "unsupported role"),
+    ([{"from": "tool", "value": "q"}], "unsupported role"),
+    ([{"from": "human", "value": {"text": "q"}}], "value must be text"),
+    ([{"from": "human", "value": ["q"]}], "value must be text"),
+    ([None], "from.*value"),
+])
+def test_sharegpt_malformed_openings_are_not_salvaged(opening: list[Any], reason: str) -> None:
+    row = {"conversations": opening}
+    for operation in (sharegpt_conversations, sharegpt_quality):
+        with pytest.raises(ValueError, match=reason):
+            operation(row)
+    # An otherwise good later exchange must not hide the malformed opening.
+    if opening:
+        row["conversations"] = opening + _sharegpt("h" * 60, "a" * 60)["conversations"]
+        for operation in (sharegpt_conversations, sharegpt_quality):
+            with pytest.raises(ValueError, match=reason):
+                operation(row)
+
+
+@pytest.mark.parametrize("length, accepted", [(49, False), (50, True), (2000, True), (2001, False)])
+def test_sharegpt_quality_keeps_character_boundaries(length: int, accepted: bool) -> None:
+    assert sharegpt_quality(_sharegpt("h" * length, "a" * 50)) is accepted
+    assert sharegpt_quality(_sharegpt("h" * 50, "a" * length)) is accepted
+
+
+@pytest.mark.parametrize("marker", ["```PYTHON", "```java", "```cpp", "```javascript"])
+def test_sharegpt_quality_keeps_code_marker_rules(marker: str) -> None:
+    assert not sharegpt_quality(_sharegpt("h" * 50, "a" * 50 + marker))

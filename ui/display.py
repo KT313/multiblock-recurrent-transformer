@@ -42,6 +42,7 @@ import os
 import re
 import signal
 import threading
+import time
 import weakref
 from collections import deque
 from collections.abc import Callable, Iterator
@@ -57,8 +58,12 @@ from rich.panel import Panel
 from rich.segment import ControlType
 from rich.text import Text
 
+from ui.live_frame import OverwriteLiveRender, synchronize_output
+
 
 _SIGHUP_REASON = "SIGHUP: the terminal closed"  # the reason of a hangup the probe confirmed
+MIN_CHANGED_REFRESH_INTERVAL = 0.5
+MAX_IDLE_REFRESH_INTERVAL = 10.0
 
 
 def _fileno(stream: TextIO) -> int | None:
@@ -98,6 +103,11 @@ class ResizeAwareLive(Live):
     frame through one of two callbacks instead of crashing the refresh thread: on_terminal_lost(reason) for an
     OSError (the terminal is gone), on_render_failed(error) for anything else (the frame is broken, the terminal
     is not). Either way the display closes and the run goes on.
+
+    With get_refresh_key, redraw changed state at most twice per second and unchanged state every ten seconds.
+    Startup/shutdown frames and pending terminal-loss handling bypass the gate; other dashboards keep Rich's timer.
+    With overwrite_frames, use padded row overwrites and synchronized output for interactive refreshes. The
+    whole-screen clear is reserved for resize; Rich's normal transient cleanup still runs when the display stops.
     """
 
     def __init__(
@@ -105,14 +115,24 @@ class ResizeAwareLive(Live):
         *args: Any,
         on_terminal_lost: Callable[[str], None] | None = None,
         on_render_failed: Callable[[BaseException], None] | None = None,
+        get_refresh_key: Callable[[], object] | None = None,
+        refresh_clock: Callable[[], float] = time.monotonic,
+        overwrite_frames: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
+        self._overwrite_frames = overwrite_frames
+        if overwrite_frames:
+            self._live_render = OverwriteLiveRender(self.renderable)  # Live applies its overflow mode before each frame
         self._frame_size: ConsoleDimensions | None = None  # the terminal size the previous frame was drawn for
         self._on_terminal_lost = on_terminal_lost
         self._on_render_failed = on_render_failed
         self._starting = False  # inside `start`, where rich handles a failed first frame itself (see `refresh`)
         self.terminal_lost_pending: str | None = None  # set by the SIGHUP handler, handled at the next refresh
+        self._get_refresh_key = get_refresh_key
+        self._refresh_clock = refresh_clock
+        self._last_refresh: float | None = None
+        self._last_refresh_key: object = None
 
     def start(self, refresh: bool = False) -> None:
         self._starting = True
@@ -125,7 +145,16 @@ class ResizeAwareLive(Live):
         reason = self.terminal_lost_pending
         if reason is None:
             try:
-                super().refresh()
+                with self._lock:
+                    now = self._refresh_clock()
+                    key = None if self._get_refresh_key is None else (self.console.size, self._get_refresh_key())
+                    if self._get_refresh_key is not None and self.is_started and not self._starting and self._last_refresh is not None:
+                        elapsed = now - self._last_refresh
+                        if elapsed < MIN_CHANGED_REFRESH_INTERVAL or (elapsed < MAX_IDLE_REFRESH_INTERVAL and key == self._last_refresh_key):
+                            return
+                    with synchronize_output(self.console, enabled=self._overwrite_frames and self.is_started):
+                        super().refresh()
+                    self._last_refresh, self._last_refresh_key = now, key
                 return
             except OSError as error:  # the terminal is gone (EIO / EBADF)
                 if self._starting:  # let rich's start stop the display and raise, else it would still start its refresh thread
@@ -147,6 +176,8 @@ class ResizeAwareLive(Live):
         size = self.console.size
         if self._frame_size is not None and size != self._frame_size:
             renderables[0] = Control(ControlType.CLEAR, ControlType.HOME)  # rich's cursor-up erase assumes the old size
+            if isinstance(self._live_render, OverwriteLiveRender):
+                self._live_render.reset_height()
         self._frame_size = size
         return renderables
 
@@ -184,13 +215,20 @@ class LiveDisplay:
     plain lines to _plain_stream instead of the panel.
     """
 
-    def __init__(self, *, stream: TextIO, console: Console | None, refresh_per_second: float, log_lines: int) -> None:
+    def __init__(
+        self, *, stream: TextIO, console: Console | None, refresh_per_second: float, log_lines: int,
+        get_refresh_key: Callable[[], object] | None = None, refresh_clock: Callable[[], float] = time.monotonic,
+        overwrite_frames: bool = False,
+    ) -> None:
         self.enabled = True
         self.logger = logging.getLogger(__name__)  # subclasses set their own; receives the "terminal gone" warning
         self._stream = stream
         self._plain_stream = stream  # where `write` goes while the display is disabled
         self._console = console if console is not None else Console(file=stream)
         self._refresh_per_second = refresh_per_second
+        self._get_refresh_key = get_refresh_key
+        self._refresh_clock = refresh_clock
+        self._overwrite_frames = overwrite_frames
         self._lock = threading.RLock()  # held by every mutation and render
         self._panel_height = log_lines
         self._panel_lines: deque[str] = deque(maxlen=log_lines)
@@ -218,6 +256,9 @@ class LiveDisplay:
             redirect_stderr=False,
             on_terminal_lost=self._terminal_lost,
             on_render_failed=self._display_failed,
+            get_refresh_key=self._get_refresh_key,
+            refresh_clock=self._refresh_clock,
+            overwrite_frames=self._overwrite_frames,
         )
         self._install_sighup_handler()
         # a terminal gone before the first frame: rich's start either stopped the display itself (a failed frame) or

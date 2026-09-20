@@ -20,8 +20,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from data_preparation.dataset_config import DatasetConfig, describe_hash_change
-from data_preparation.layout import processed_columns
+from data_preparation.lib.dataset_config import DatasetConfig, describe_hash_change
+from data_preparation.lib.layout import processed_columns
+from data_preparation.lib.stages.global_dedup import global_policy
 from data_preparation.lib.storage.manifest import Manifest, has_shards, shard_problem
 from data_preparation.lib.storage.parquet import list_parquet_files, shard_name
 
@@ -82,7 +83,8 @@ def next_shard_to_write(manifest: Manifest) -> str:
 
 
 def assess_processed_folder(
-    config: DatasetConfig, name: str, folder: Path, raw_shards: ShardList | None, *, check_files: bool = True
+    config: DatasetConfig, name: str, folder: Path, raw_shards: ShardList | None, *, check_files: bool = True,
+    global_output: bool = False
 ) -> ProcessedAssessment:
     """
     The verdict on processed/<name> at folder, given the raw shards it will be able to build from as
@@ -108,7 +110,10 @@ def assess_processed_folder(
     if not manifest.is_current(config.processed_hash(name)):
         changes = describe_hash_change(manifest.hash_payload, config.processed_hash_payload(name))
         return ProcessedAssessment("stale", "stale: " + "; ".join(changes), manifest)
-    if manifest.columns != list(processed_columns(config.sources[name].kind)):
+    if global_output and manifest.extra.get("global_dedup") != global_policy(config):
+        return ProcessedAssessment("stale", "stale: missing or incompatible dataset-wide Bloom policy; replay required", manifest)
+    expected_columns = [*processed_columns(config.sources[name].kind, config.sources[name].instruction_format), *(["global_hash"] if global_output else [])]
+    if manifest.columns != expected_columns:
         return ProcessedAssessment("stale", "stale: the shards predate the current columns", manifest)
     covered = manifest.input_shards
     if check_files:
@@ -118,7 +123,7 @@ def assess_processed_folder(
                 return ProcessedAssessment("broken_shard", f"broken: {problem}", manifest)
         listed = {shard.name for shard in manifest.shards}
         unlisted = sorted(path.name for path in list_parquet_files(folder) if path.name not in listed)
-        if unlisted == [next_shard_to_write(manifest)] and _more_raw_follows(covered, raw_shards):
+        if unlisted == [next_shard_to_write(manifest)] and (_more_raw_follows(covered, raw_shards) or (global_output and not manifest.generation_complete)):
             reason = f"crash leftover {unlisted[0]}: the next shard the resumed build writes; the build overwrites it"
             return ProcessedAssessment("crash_leftover", reason, manifest)
         if unlisted:

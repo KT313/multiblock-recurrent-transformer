@@ -21,7 +21,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from data_preparation.conftest import REPO, REV, FakeHub, RecordingFile
-from data_preparation.dataset_config import SourceConfig
+from data_preparation.lib.dataset_config import SourceConfig
 from data_preparation.lib.sources import hub_files
 from data_preparation.lib.sources.hub_files import (
     HUB_REQUEST_TIMEOUT,
@@ -125,6 +125,17 @@ def test_every_format(hub: FakeHub, suffix: str) -> None:
     src = _src(load_kwargs={"data_files": f"x/*{suffix}"})
     assert _ids(LOADERS["hf_files"](src, 2, 2)) == ["o2", "o3"]  # in-memory index (index_dir=None)
     assert _ids(LOADERS["hf_files"](src, 0, 9)) == [f"o{i}" for i in range(5)]
+
+
+@pytest.mark.parametrize("suffix", [".parquet", ".jsonl", ".jsonl.zst", ".jsonl.gz", ".json.gz", ".json"])
+def test_prefetched_remote_formats_preserve_rows_and_resume(hub: FakeHub, suffix: str) -> None:
+    hub.add(f"x/one{suffix}", _rows("o", 20))
+    src = _src(load_kwargs={"data_files": f"x/*{suffix}", "max_cached_file_mb": 0})
+    load = LOADERS["hf_files"]
+    baseline = list(load(src, 2, 7))
+    assert list(load(src, 2, 7, SharedLoaderParameters(download_prefetch_mb=1))) == baseline
+    resume_offset = 2 + len(baseline)
+    assert list(load(src, resume_offset, 100, SharedLoaderParameters(download_prefetch_mb=1))) == list(load(src, resume_offset, 100))
 
 
 def test_unknown_format_and_missing_files(hub: FakeHub) -> None:
@@ -454,8 +465,9 @@ def test_every_hub_request_is_bounded_by_the_request_timeout(monkeypatch: pytest
     assert repo_listing(REPO, REV, None) == (["data/a.parquet"], "abc")
     assert calls == [(REPO, REV, HUB_REQUEST_TIMEOUT)]
     assert get_session().timeout == httpx.Timeout(HUB_REQUEST_TIMEOUT)
-    configure_hub_http()  # idempotent (cached): no second configuration
-    assert configure_hub_http.cache_info().hits >= 1
+    client = get_session()
+    configure_hub_http()  # idempotent: no second factory installation/closed client
+    assert get_session() is client
 
 
 def test_a_file_downloaded_whole_into_the_cache_counts_its_size(hub: FakeHub) -> None:
@@ -602,6 +614,104 @@ def test_legacy_index_without_revision_upgrades_once_then_guards(hub: FakeHub, t
     hub.sha = "commit-2"
     with pytest.raises(RuntimeError, match="file index was built at revision"):
         FileIndex.open(REPO, REV, "data/*.parquet", index_dir, None)
+
+
+@pytest.mark.parametrize("requested", ["moving-branch", None, "commit-a"])
+def test_active_index_reads_only_its_listing_commit(
+    hub: FakeHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, requested: str | None,
+) -> None:
+    hub.add("data/a.parquet", _rows("a", 4))
+    file = "data/a.parquet"
+    commit = "commit-a"
+    current = commit
+    calls: list[tuple[str, str | None]] = []
+
+    def listing(repo: str, revision: str | None, token: str | None) -> tuple[list[str], str]:
+        nonlocal current
+        assert revision == requested
+        calls.append(("listing", revision))
+        if requested != commit:
+            current = "commit-b"  # the branch moves immediately after the listing snapshot
+        return [file], commit
+
+    def resolve(repo: str, revision: str | None, token: str | None) -> str:
+        assert revision == requested
+        calls.append(("resolve", revision))
+        return current
+
+    def sizes(repo: str, paths: list[str], revision: str | None, token: str | None) -> dict[str, int]:
+        calls.append(("sizes", revision))
+        assert revision == commit
+        return {path: hub.files[path].stat().st_size for path in paths}
+
+    def download(repo: str, path: str, revision: str | None, token: str | None) -> Path:
+        calls.append(("download", revision))
+        assert revision == commit
+        return hub.files[path]
+
+    def remote(repo: str, path: str, revision: str | None, token: str | None, block_size: int) -> BinaryIO:
+        calls.append(("remote", revision))
+        assert revision == commit
+        return RecordingFile(hub.files[path])
+
+    for name, replacement in (("repo_listing", listing), ("resolve_revision", resolve), ("paths_info", sizes),
+                              ("hub_download", download), ("open_remote", remote)):
+        monkeypatch.setattr(hub_files, name, replacement)
+    index_dir = tmp_path / "index"
+    index = FileIndex.open(REPO, requested, "data/*.parquet", index_dir, None)
+    assert index.revision == requested and index.read_revision == commit
+    assert _ids(read_rows(index, 0, 1)) == ["a0"]
+    assert _ids(read_rows(index, 0, 1, fetcher=HubFetcher(max_cached_file_mb=0))) == ["a0", "a1"]
+    assert index.row_groups[file] == [2, 2]  # footer/range read at the listing commit
+    assert FileIndex.open(REPO, requested, "data/*.parquet", index_dir, None) is index
+    index.sizes.clear()  # later metadata refill is immutable too
+    index.ensure_sizes(None)
+    assert _ids(read_rows(index, 2, 1)) == ["a2"]
+    assert calls == [("listing", requested), ("sizes", commit), ("download", commit), ("remote", commit),
+                     ("sizes", commit), ("download", commit)]
+    _forget_open_indexes()
+    if requested == commit:
+        assert FileIndex.open(REPO, requested, "data/*.parquet", index_dir, None).read_revision == commit
+    else:
+        with pytest.raises(RuntimeError, match="file index was built at revision commit-a.*commit-b"):
+            FileIndex.open(REPO, requested, "data/*.parquet", index_dir, None)
+
+
+def test_unknown_identity_cannot_reach_metadata_or_payload_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    index = FileIndex(REPO, "moving-branch", "*.jsonl", files=["f.jsonl"])
+
+    def unexpected(*args: Any) -> Any:
+        pytest.fail("an unresolved index must not perform a mutable Hub read")
+
+    monkeypatch.setattr(hub_files, "paths_info", unexpected)
+    monkeypatch.setattr(hub_files, "hub_download", unexpected)
+    monkeypatch.setattr(hub_files, "open_remote", unexpected)
+    with pytest.raises(RuntimeError, match="FileIndex.open"):
+        index.ensure_sizes(None)
+    index.sizes["f.jsonl"] = 1
+    for threshold in (0, 32):
+        with pytest.raises(RuntimeError, match="FileIndex.open"):
+            list(read_rows(index, 0, 1, fetcher=HubFetcher(max_cached_file_mb=threshold)))
+
+
+def test_legacy_revision_resolution_failure_does_not_upgrade_or_read(
+    hub: FakeHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = index_path(tmp_path, REPO, REV, "*.jsonl")
+    path.parent.mkdir(parents=True)
+    original = json.dumps({"files": ["f.jsonl"], "rows": {}})
+    path.write_text(original)
+    failure = ConnectionError("fixture resolution unavailable")
+
+    def resolve(*args: Any) -> str:
+        raise failure
+
+    monkeypatch.setattr(hub_files, "resolve_revision", resolve)
+    with pytest.raises(ConnectionError) as error:
+        FileIndex.open(REPO, REV, "*.jsonl", tmp_path, None)
+    assert error.value is failure
+    assert path.read_text() == original
+    assert hub.size_lookups == 0 and hub.downloads == [] and hub.streams == []
 
 
 # --- the save clock -----------------------------------------------------------------------------------------------------

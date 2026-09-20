@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 from training.ui.throughput import Throughput
 
 MIN_LOG_LINES = 2  # the log panel never shrinks below this on a short terminal; the events panel goes down to one line
+RECURRENCE_METRIC_KEYS = ("token_correlation", "token_dispersion", "state_sensitivity")
 
 # metric keys of the step dict (`RunLogger.log_step`) shown in the metrics table, with labels
 METRIC_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -19,6 +20,9 @@ METRIC_COLUMNS: tuple[tuple[str, str], ...] = (
     ("ppl", "ppl"),
     ("lr", "lr"),
     ("grad_norm", "grad norm"),
+    ("token_correlation", "tok corr"),
+    ("token_dispersion", "tok disp"),
+    ("state_sensitivity", "state sens"),
     ("tokens/second", "tokens/s"),
     ("seconds/step", "s/step"),
     ("total_tokens", "tokens"),
@@ -57,6 +61,9 @@ METRIC_FORMATS: dict[str, str] = {
     "ppl": "{:.2f}",
     "lr": "{:.2e}",
     "grad_norm": "{:.3f}",
+    "token_correlation": "{:.4f}",
+    "token_dispersion": "{:.2e}",
+    "state_sensitivity": "{:.2e}",
     "tokens/second": "{:,.0f}",
     "seconds/step": "{:.2f}s",
 }
@@ -67,6 +74,8 @@ def format_metric(key: str, value: float) -> str:
     The table / fallback-line rendering of one metric of the step dict.
     """
 
+    if key in RECURRENCE_METRIC_KEYS and not math.isfinite(value):
+        return "n/a"
     if key == "total_tokens":
         return format_tokens(value)
     return METRIC_FORMATS.get(key, "{:.4g}").format(value)

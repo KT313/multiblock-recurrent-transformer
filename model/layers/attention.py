@@ -16,6 +16,8 @@ import torch
 from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask, create_mask, flex_attention
 
+from ..generation import KVCache
+from ..kernels.runtime import load_rope
 from .init import Linear
 
 if TYPE_CHECKING:
@@ -180,21 +182,44 @@ class CausalSelfAttention(torch.nn.Module):
             # One bias vector per head for q and one for k (index 0 / 1 of the first axis), added before RoPE.
             self.qk_bias = torch.nn.Parameter(torch.zeros(2, 1, self.n_head, self.head_dim))
         self.proj = Linear(config.n_embd, config.n_embd, bias=False, init_method=config.init.fn("out_attn"))
+        self._custom_rope = load_rope() if config.use_custom_kernels else None
 
-    def forward(self, x: Tensor, freqs_cis: Tensor, mask: AttentionMask = None) -> Tensor:
+    def forward(
+        self, x: Tensor, freqs_cis: Tensor, mask: AttentionMask = None, cache: KVCache | None = None,
+    ) -> Tensor:
         B, S, E = x.shape
-        q, k, v = self.Wqkv(x).split(E, dim=2)  # each (B, S, E)
-        q = q.view(B, S, self.n_head, self.head_dim)
-        k = k.view(B, S, self.n_head, self.head_dim)
-        v = v.view(B, S, self.n_head, self.head_dim)
-        if self.use_qk_bias:
-            q_bias, k_bias = self.qk_bias.split(1, dim=0)  # type: ignore[no-untyped-call]  # torch stub gap
-            # The bias is a float32 parameter; the sum is cast back so q/k keep the activation dtype under autocast.
-            q = (q + q_bias).to(q.dtype)
-            k = (k + k_bias).to(q.dtype)
-        q, k = apply_rotary_emb_complex_like(q, k, freqs_cis=freqs_cis)
+        rotate = self._custom_rope if self._custom_rope is not None else qkv_bias_rope
+        q, k, v = rotate(
+            self.qk_bias if self.use_qk_bias else None, self.Wqkv(x), freqs_cis, self.n_head,
+        )
 
+        if cache is not None:
+            k, v = cache.append_and_get(k, v)
         y = attention(q, k, v, mask)
         y = y.reshape(B, S, E).contiguous()
         out: Tensor = self.proj(y)
         return out
+
+
+def qkv_bias_rope(
+    qk_bias: Tensor | None, qkv: Tensor, freqs_cis: Tensor, n_head: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Split the original projection, rotate Q/K, and preserve V as a view of the projection."""
+    batch, length, width = qkv.shape
+    embd = width // 3
+    q, k, v = qkv.split(embd, dim=2)  # type: ignore[no-untyped-call]  # torch stub gap
+    shape = (batch, length, n_head, embd // n_head)
+    q, k = qk_bias_rope(qk_bias, q.view(shape), k.view(shape), freqs_cis)
+    return q, k, v.view(shape)
+
+
+def qk_bias_rope(qk_bias: Tensor | None, q: Tensor, k: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
+    """
+    Bias addition and rotation, shared by attention and component experiments. Preserve each activation rounding.
+    """
+
+    if qk_bias is not None:
+        q_bias, k_bias = qk_bias.split(1, dim=0)  # type: ignore[no-untyped-call]  # torch stub gap
+        q = (q + q_bias).to(q.dtype)
+        k = (k + k_bias).to(q.dtype)
+    return apply_rotary_emb_complex_like(q, k, freqs_cis=freqs_cis)

@@ -13,6 +13,9 @@ from typing import Any, Literal, Optional
 # re-exported from jsonargparse._actions at runtime but missing from the package's typed public surface
 from jsonargparse import ActionConfigFile, ArgumentParser  # type: ignore[attr-defined]
 
+from training.sample_settings import normalize_sample_temperatures
+from training.optimizer_validation import validate_adam_hyperparameters, validate_scalar
+
 # The activation-checkpointing modes of the recurrence iterations, `model.blocks.recurrence.CHECKPOINT_MODES` (which
 # imports torch; this module stays framework-neutral, a settings test keeps the two equal).
 CHECKPOINT_MODES: tuple[str, ...] = ("none", "selective", "full")
@@ -20,8 +23,22 @@ CHECKPOINT_MODES: tuple[str, ...] = ("none", "selective", "full")
 # The optimizers `training.optim.build_optimizer` builds and the schedules `training.lr_schedule` implements. Both
 # modules import torch (directly or through the stage manager); this module stays framework-neutral, so the names
 # are copied here to be checked at construction time, and settings tests keep the copies equal to the originals.
-OPTIMIZERS: tuple[str, ...] = ("AdamW", "ELLISAdam")
+OPTIMIZERS: tuple[str, ...] = ("AdamW", "ELLISAdam", "ELLISAdam8bit")
 LR_SCHEDULES: tuple[str, ...] = ("trapezoid",)
+CORRELATION_TARGETS = ("adapter", "attention", "mlp")
+
+
+def normalize_log_correlations(value: object) -> str:
+    """Canonical, validated comma-separated selector; omitted/null/empty means no detailed correlations."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError('log_correlations must be a string containing adapter, attention and/or mlp, or empty')
+    selected = {word.strip().lower() for word in value.split(',') if word.strip()}
+    unknown = selected.difference(CORRELATION_TARGETS)
+    if unknown:
+        raise ValueError(f"Unknown log_correlations target(s): {', '.join(sorted(unknown))}; choose adapter, attention, mlp")
+    return ','.join(target for target in CORRELATION_TARGETS if target in selected)
 
 # The value rules of `Settings`, one loop each in `__post_init__`: fields that must be set, be > 0, be >= 0. Rules
 # relating two fields stay explicit below the loops.
@@ -31,18 +48,20 @@ REQUIRED_SETTINGS: dict[str, str] = {
     "stage_base_lrs": "one base LR per stage of the dataset config",
 }
 POSITIVE_SETTINGS: dict[str, str] = {
-    "log_step_interval": "save_step_interval is the only interval 0 disables",
-    "eval_step_interval": "save_step_interval is the only interval 0 disables",
+    "log_step_interval": "basic training metrics must have a positive interval",
+    "eval_step_interval": "validation must have a positive interval",
     "eval_iters": "validation batches per depth",
     "grad_clip": "0 would zero every gradient",
     "tokens_per_micro_batch": "the pack length; every micro-batch is one row of this many tokens",
     "micro_batches_per_step": "packs per optimizer step; 0 or less makes the micro-batch loop of a step run zero times",
     "validation_batch_size": "rows per validation forward",
     "prepare_pass_workers": "process pool size of each cleaning pass of the in-process dataset build",
+    "sample_batch_size": "prompts per fixed sample-generation batch",
     "sample_max_new_tokens": "tokens generated per sample prompt",
     "benchmark_batch_size": "sequences per lm-eval forward",
 }
 NON_NEGATIVE_SETTINGS: tuple[str, ...] = (
+    "log_gradient_metrics_interval",
     "save_step_interval",
     "warmup_steps",
     "cooldown_steps",
@@ -59,7 +78,8 @@ class OptimizerConfig:
 
     A dataclass so jsonargparse merges per-field CLI overrides (`--optim_config.lr 3e-4`) and rejects unknown names.
     `lr` is NOT the schedule's LR (`stage_base_lrs` is); ELLISAdam keeps it as `init_lr`, the weight-decay reference.
-    The last four flags exist only on ELLISAdam; `build_optimizer` rejects non-default values for other optimizers.
+    The last four flags exist only on ELLISAdam and ELLISAdam8bit (the same optimizer with 8-bit moments for every
+    group but the embeddings); `build_optimizer` rejects non-default values for other optimizers.
     """
 
     lr: float = 1e-4  # constructor LR; for ELLISAdam the weight-decay reference (decay = lr / init_lr × weight_decay)
@@ -70,6 +90,19 @@ class OptimizerConfig:
     atan_adam: bool = False  # ELLISAdam only: atan2 update instead of the eps-guarded division
     running_init: bool = False  # ELLISAdam only: initialise the moments from the first gradient
     decouple_wd: bool = True  # ELLISAdam only: weight decay relative to init_lr instead of multiplied by lr
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self, optimizer: str | None = None) -> None:
+        """Validate again at use time: callers may have edited this mutable config."""
+
+        validate_scalar(self.lr, "optim_config.lr", positive=optimizer in ("ELLISAdam", "ELLISAdam8bit"))
+        # None remains a default-selection sentinel; validate the selected value without replacing it.
+        eps = self.eps if self.eps is not None else (1e-8 if optimizer == "AdamW" else 1e-6)
+        validate_adam_hyperparameters(
+            betas=self.betas, eps=eps, weight_decay=self.weight_decay, prefix="optim_config"
+        )
 
 
 @dataclass
@@ -91,13 +124,16 @@ class Settings:
     # Data: `train()` (`training/run.py`) verifies the prepared data and, with `auto_prepare`, builds what is missing
     # (`python data_preparation/prepare.py prepare --dataset_config ...`; auto-prepare never deletes raw folders).
     dataset_dir: str = "dataset"  # root of the prepared data (sources/, processed/, tokenizers/)
-    auto_prepare: bool = True  # build missing data in-process before training; False: fail with the build command
+    auto_prepare: bool = True  # True: exclusive dataset access and auto-build; False: shared read-only access
     prepare_num_workers: int = 2  # sources processed at a time by the in-process build (= prepare.py --num_workers)
     prepare_pass_workers: int = 4  # worker processes of each cleaning pass of the in-process build (--pass_workers)
     prepare_max_parallel_downloads: int = 2  # sources downloading at a time during the in-process build
     stage_base_lrs: list[float] = field(default_factory=list)  # base LR per dataset-config stage, positional
     allow_dataset_change: bool = False  # resume from a checkpoint written with a different dataset config
     allow_settings_change: bool = False  # resume although settings / model config differ (see training/checkpoint.py)
+
+    # Versioned objective, recorded in run/checkpoint/measurement settings; no legacy execution mode.
+    loss_normalization: Literal["supervised_token_v1"] = "supervised_token_v1"
 
     # Run
     run_name: str = "crow-300m"
@@ -108,6 +144,7 @@ class Settings:
 
     # Model
     model_overwrite: dict[str, Any] = field(default_factory=dict)  # RecurrentConfig keys overriding the architecture
+    use_custom_kernels: bool = True  # strict CUDA MLP, LM-head loss and RoPE kernels; false selects native operations
     training_max_sequence_length: int = 2048  # documents are cut to this many tokens at training time; packs and validation rows are sized by it; at most the dataset's and the model's length
 
     # Backend
@@ -118,6 +155,7 @@ class Settings:
 
     # Optimizer + LR schedule
     optimizer: str = "ELLISAdam"
+    optimizer_sharding: Literal["none", "zero1"] = "none"  # optimizer state only; requires DDP
     optim_config: OptimizerConfig = field(default_factory=OptimizerConfig)  # typed; CLI overrides merge per field
     no_weight_decay_for_bias_and_norm_params: bool = True
     grad_clip: float = 1.0
@@ -129,7 +167,8 @@ class Settings:
     # Evaluation / logging / checkpoints. Validation batches are padded rows (not packs): `validation_batch_size`
     # rows padded to the longest of them, rounded up to a multiple of `validation_padding_multiple`.
     log_step_interval: int = 1
-    log_gradient_metrics: bool = True  # per-parameter-group gradient/update statistics at every log step
+    log_gradient_metrics_interval: int = 1  # gradient/update + representation/state probes every N completed optimizer steps; 0 disables; a positive multiple of log_step_interval
+    log_correlations: str | None = ""  # detailed probe targets: comma-separated adapter,attention,mlp; null/empty disables
     eval_step_interval: int = 100
     eval_iters: int = 64  # validation batches per depth over ALL ranks; a multiple of the number of ranks (`eval_iters_per_rank`)
     validation_batch_size: int = 4  # rows per validation forward
@@ -151,11 +190,14 @@ class Settings:
     # {run dir}/samples/ and {run dir}/benchmarks/, named by step.
     sample_step_interval: int = 0  # write samples every this many steps (0: never)
     sample_at_training_progress: list[float] = field(default_factory=lambda: [100.0])  # ... and after the steps at these percentages of the run (0: after the first step, 100: after the last); combined with the interval
+    sample_batch_size: int = 8
     sample_max_new_tokens: int = 64
-    sample_temperature: float = 0.0  # 0: greedy decoding
+    sample_use_cache: bool = True  # fixed per-token/core latents and per-recurrence K/V; False: legacy prefix resampling
+    sample_temperature: float | list[float] = 0.0  # scalar or list; 0: greedy decoding
     sample_recurrences: list[list[int]] = field(default_factory=list)  # recurrent steps per block per sampling pass, e.g. [[4, 4, 4], [12, 12, 12]]; empty: the mean recurrence once
     benchmark_step_interval: int = 0  # run the benchmarks every this many steps (0: never)
-    benchmark_at_training_progress: list[float] = field(default_factory=list)  # ... and at these percentages of the run, like sample_at_training_progress (needs the eval extra: uv sync --extra eval)
+    benchmark_at_training_progress: list[float] = field(default_factory=list)  # ... and at these percentages of the run, like sample_at_training_progress
+    benchmark_apply_chat_template: bool = False
     benchmark_tasks: list[str] = field(default_factory=lambda: list(DEFAULT_BENCHMARK_TASKS))  # lm-eval task names
     benchmark_limit: Optional[int] = None  # examples per task (None: all); a few hundred keeps in-training runs short
     benchmark_num_fewshot: int = -1  # examples in the context of every task (-1: each task's own default, e.g. 5 for gsm8k)
@@ -163,6 +205,11 @@ class Settings:
     benchmark_recurrences: list[list[int]] = field(default_factory=list)  # like sample_recurrences, for the benchmarks
 
     def __post_init__(self) -> None:
+        self.log_correlations = normalize_log_correlations(self.log_correlations)
+        if not isinstance(self.use_custom_kernels, bool):
+            raise ValueError("use_custom_kernels must be a boolean")
+        if isinstance(self.log_gradient_metrics_interval, bool) or not isinstance(self.log_gradient_metrics_interval, int):
+            raise ValueError("log_gradient_metrics_interval must be an integer >= 0")
         # dataclasses check no types at runtime, and this setting used to be a free-form dict: fail here, by name
         if not isinstance(self.optim_config, OptimizerConfig):
             raise ValueError(
@@ -184,18 +231,19 @@ class Settings:
         # optimizer used to fail after the build, an unknown schedule at the first optimizer step)
         if self.optimizer not in OPTIMIZERS:
             raise ValueError(f"optimizer must be one of {', '.join(OPTIMIZERS)}, not {self.optimizer!r}")
+        if self.optimizer_sharding not in ("none", "zero1"):
+            raise ValueError("optimizer_sharding must be 'none' or 'zero1'")
+        if self.optimizer_sharding == "zero1" and self.backend != "ddp":
+            raise ValueError("optimizer_sharding='zero1' requires backend='ddp'")
         if self.lr_schedule not in LR_SCHEDULES:
             raise ValueError(f"lr_schedule must be one of {', '.join(LR_SCHEDULES)}, not {self.lr_schedule!r}")
         if any(depth <= 0 for depth in self.partial_depth_eval):
             raise ValueError(
                 f"partial_depth_eval must list positive recurrence depths, got {self.partial_depth_eval}"
             )
-        if self.optim_config.lr <= 0:  # ELLISAdam divides by it (the decoupled-decay reference init_lr)
-            raise ValueError(
-                f"optim_config.lr must be positive, got {self.optim_config.lr}: it is the optimizer's constructor "
-                "LR and, for ELLISAdam, the reference of the decoupled weight decay (decay = lr / init_lr x "
-                "weight_decay). The schedule's learning rate is stage_base_lrs"
-            )
+        self.optim_config.validate(self.optimizer)
+        if self.loss_normalization != "supervised_token_v1":
+            raise ValueError("loss_normalization must be supervised_token_v1; legacy pack weighting is unsupported")
         if self.gradient_checkpointing not in CHECKPOINT_MODES:  # jsonargparse checks the Literal; direct construction does not
             raise ValueError(
                 f"gradient_checkpointing must be one of {', '.join(CHECKPOINT_MODES)}, not {self.gradient_checkpointing!r}"
@@ -211,10 +259,14 @@ class Settings:
                 f"eval_step_interval ({self.eval_step_interval}) must be a multiple of log_step_interval "
                 f"({self.log_step_interval}): validation results would be computed and never logged"
             )
+        if self.log_gradient_metrics_interval > 0 and self.log_gradient_metrics_interval % self.log_step_interval != 0:
+            raise ValueError(
+                f"log_gradient_metrics_interval ({self.log_gradient_metrics_interval}) must be a multiple of "
+                f"log_step_interval ({self.log_step_interval})"
+            )
         if self.resume_checkpoint_path and not self.resume:
             raise ValueError("resume_checkpoint_path is set but resume is false; set resume: true to use it")
-        if self.sample_temperature < 0:
-            raise ValueError("sample_temperature must be >= 0 (0: greedy)")
+        normalize_sample_temperatures(self.sample_temperature)
         if self.benchmark_limit is not None and self.benchmark_limit <= 0:
             raise ValueError("benchmark_limit must be positive or null (all examples)")
         if self.benchmark_num_fewshot < -1:
@@ -230,6 +282,11 @@ class Settings:
             raise ValueError(
                 "benchmarks are requested (benchmark_at_training_progress / benchmark_step_interval) but benchmark_tasks is empty"
             )
+
+    def validate_world_size(self, world_size: int) -> None:
+        """Refuse unsplittable training and validation counts before any run setup work."""
+        self.micro_batches_per_rank(world_size)
+        self.eval_iters_per_rank(world_size)
 
     def micro_batches_per_rank(self, world_size: int) -> int:
         """

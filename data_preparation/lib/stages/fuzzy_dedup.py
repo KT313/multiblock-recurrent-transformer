@@ -31,8 +31,10 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from data_preparation.dataset_config import DedupConfig
+from data_preparation.lib.dataset_config import DedupConfig
 from data_preparation.lib.iteration import chunks
+from data_preparation.lib.download_debug import WorkerDebugOptions, initialize_worker_debug, measured_worker, worker_debug_options
+from data_preparation.lib.download_profile import measure, measured
 from data_preparation.lib.stages.row_pipeline import get_ngrams
 
 Row = dict[str, Any]
@@ -58,7 +60,7 @@ def _import_datasketch() -> tuple[Any, Any]:
         from datasketch import MinHash, MinHashLSH
     except ImportError as exc:
         raise ImportError(
-            "dedup.mode=minhash needs the `datasketch` package (`uv sync --all-extras`), or use dedup.mode=exact"
+            "dedup.mode=minhash needs the `datasketch` package (`uv sync`), or use dedup.mode=exact"
         ) from exc
     return MinHash, MinHashLSH
 
@@ -77,7 +79,7 @@ def _minhash_kwargs(num_perm: int) -> dict[str, Any]:
     return kwargs
 
 
-def _init_worker(num_perm: int, ngram: int) -> None:
+def _init_worker(num_perm: int, ngram: int, debug: WorkerDebugOptions | None = None) -> None:
     """
     Set the signature parameters of a spawn worker (pool initializer).
     """
@@ -86,8 +88,10 @@ def _init_worker(num_perm: int, ngram: int) -> None:
     _NGRAM = ngram
     _MINHASH_KWARGS.clear()
     _MINHASH_KWARGS.update(_minhash_kwargs(num_perm))
+    initialize_worker_debug(debug, "minhash")
 
 
+@measured("minhash_signature")
 def _signature(text: str, ngram: int, minhash_kwargs: dict[str, Any]) -> Signature:
     """
     MinHash hash values of the word n-grams of text (plain numpy array, cheap to pickle); an empty array for
@@ -105,6 +109,7 @@ def _signature(text: str, ngram: int, minhash_kwargs: dict[str, Any]) -> Signatu
     return np.asarray(minhash.hashvalues, dtype=np.uint64)
 
 
+@measured_worker("minhash_signatures")
 def _signatures(texts: list[str]) -> list[Signature]:
     """
     Worker task: the signatures of one chunk of texts, with the worker's parameters of _init_worker.
@@ -154,7 +159,8 @@ def _signatures_in_pool(
     def oldest_finished() -> Iterator[tuple[Row, Signature]]:
         chunk, pending = inflight.popleft()
         try:
-            return zip(chunk, pending.result())
+            with measure("worker_result_wait"):
+                return zip(chunk, pending.result())
         except BrokenProcessPool as error:
             raise _worker_died(error) from error
 
@@ -162,7 +168,7 @@ def _signatures_in_pool(
         max_workers=pass_workers,
         mp_context=multiprocessing.get_context("spawn"),
         initializer=_init_worker,
-        initargs=(dedup.num_perm, dedup.ngram),
+        initargs=(dedup.num_perm, dedup.ngram, worker_debug_options()),
     )
     try:
         for chunk in chunks(rows, chunk_size):
@@ -176,15 +182,18 @@ def _signatures_in_pool(
         while inflight:
             yield from oldest_finished()
     finally:
-        pool.shutdown(cancel_futures=True)
+        with measure("worker_shutdown"):
+            pool.shutdown(cancel_futures=True)
 
 
 def fuzzy_dedup(
     rows: Iterator[Row], dedup: DedupConfig, stats: dict[str, Any], pass_workers: int = 1, chunk_size: int = CHUNK_SIZE
 ) -> Iterator[Row]:
     """
-    Yield the rows whose MinHash signature has no near-duplicate (Jaccard >= dedup.threshold) among the rows
-    yielded before; rows too short for a single n-gram pass through untouched (stats["too_short_passed"], they
+    Yield rows with no approximate MinHash/LSH candidate among previously yielded rows. The threshold tunes
+    candidate matching; actual Jaccard similarity is not checked, so below-threshold removals and missed
+    duplicates are possible. This approximate policy is intentional; rows too short for a single n-gram pass
+    through untouched (stats["too_short_passed"], they
     are only deduplicated exactly). stats gets threshold, num_perm, near_duplicates_removed,
     near_duplicate_rate and seconds. See the module docstring for the memory footprint.
     """

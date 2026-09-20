@@ -9,7 +9,7 @@ uv run python data_preparation/prepare.py describe --dataset_config config/datas
 Do not edit by hand: change the dataset config and regenerate. Token budgets are the stage budgets of the
 config times the stage weights; the training loader packs rows end to end, so a
 source is consumed by the token length of its rows. The training stream realises the weights as token shares by
-filling its packing pool from the source with the largest token deficit (`BatchStream` in `training/step.py`;
+filling its packing pool from the source with the largest token deficit (`BatchStream` in `training/steps/batches.py`;
 equal deficits go to the alphabetically smallest source name, so the order of the `sources:` block below never
 changes the stream).
 The rows columns estimate how many rows that is from
@@ -18,21 +18,16 @@ downloaded shards then measure the real one).
 
 ## Notes
 
-Dataset definition of the thesis run (crow-300m-final). Referenced from `config/crow_300m_final.yaml` via
+Dataset definition for crow-300m-final. Referenced from `config/crow_300m_final.yaml` via
 `dataset_config`. Materialise with `python data_preparation/prepare.py prepare --dataset_config <this file>`;
 training does it automatically when something is missing (`auto_prepare`). `nampdn-ai/mini-peS2o` is gated:
 export `HF_TOKEN` before building. This comment block is rendered into `docs/data_mixture.md` by
 `prepare.py describe`.
 
-Relation to the thesis run: the thesis data was prepared with exact deduplication, fuzzy (MinHash) deduplication
-at Jaccard threshold 0.95 and real tokenizer counts truncated to 2048 tokens, with the quality filter, benchmark
-decontamination and PII masking all skipped. This config mirrors that as closely as the restructured pipeline
-allows: exact dedup on, tokenizer counts capped at 2048, quality filter and decontamination off. Fuzzy dedup is
-off here (it is available as `dedup: {mode: minhash, threshold: 0.95, num_perm: 256}`), and PII masking no longer
-exists. The per-stage token budgets are the thesis budgets (3.3B + 1.5B + 0.15B tokens); the stage weights are
-the thesis run's; per-source download sizes are derived from the token budget (stage tokens × weight ÷ the
-source's tokens per row, × 1.2) instead of the fixed row counts of the thesis scripts. Several HuggingFace ids had to move (wikipedia -> wikimedia/wikipedia 20231101.en,
-gsm8k -> openai/gsm8k, arxiv -> common-pile/arxiv_papers_filtered), and every source is pinned to a revision.
+Processing: exact deduplication and tokenizer counts capped at 2048 tokens; quality filtering,
+decontamination and fuzzy deduplication are disabled. Stage budgets are 3.3B + 1.5B + 0.15B tokens.
+Download row budgets are derived from token exposure divided by estimated tokens per row, with 20% headroom.
+Every source is pinned to a revision.
 
 ## Tokenizer, sequence length and token counting
 

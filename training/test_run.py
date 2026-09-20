@@ -11,9 +11,10 @@ import logging
 import math
 import shutil
 from collections.abc import Callable
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -40,26 +41,31 @@ from training.testing.golden import (
 )
 from training import logger as logger_module
 from training import run as run_module
+from training.execution import loop as loop_helpers
+from training.run import train
+from training.execution import checkpoints as checkpoint_helpers, setup as setup_helpers
 from training.logger import TrainingReport
-from training.run import (
+from training.execution import (
     RunState,
     build_run_model,
     build_run_optimizer,
     build_stage_manager,
+    check_evaluation_recurrences,
     check_sequence_lengths,
     check_tokenizer_vocabulary,
     create_backend,
     prepare_run_directory,
     record_run_config,
     restore_checkpoint_if_resuming,
-    run_directory_of,
-    stop_requested,
-    train,
+    get_run_directory,
+    is_stop_requested,
 )
-from data_preparation.lib.build.lock import TRAIN_LOCK_NAME, RunLocked, run_lock
+from data_preparation.lib.build.lock import TRAIN_LOCK_NAME, RunLocked, build_lock, run_lock
+from data_preparation import load_dataset_config
 from training.settings import Settings, parse_settings
 from training.stage_manager import StageManager
-from training.step import TrainingProgress
+from training.steps import TrainingProgress
+from training.step import run_one_optimizer_step
 from evaluation.prompts import DEFAULT_PROMPTS
 from training.ui.common import TRAIN_LOG_NAME, TRAIN_REPORT_NAME
 
@@ -70,10 +76,13 @@ def _run(
     yaml_path: Path, backend: SingleDeviceBackend | None = None, should_stop: Callable[[], bool] | None = None
 ) -> TrainingReport:
     """
-    Run training on the yaml (the backend of the settings unless one is given) and return its report.
+    Run training on the CPU at the yaml's precision unless an explicit backend is supplied.
     """
 
-    return train(parse_settings(["--config", str(yaml_path)]), backend=backend, should_stop=should_stop, keep_history=True)
+    settings = parse_settings(["--config", str(yaml_path)])
+    if backend is None:
+        backend = SingleDeviceBackend(device="cpu", precision=settings.precision)
+    return train(settings, backend=backend, should_stop=should_stop, keep_history=True)
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -109,10 +118,10 @@ def test_create_backend_follows_the_settings(tiny_settings: Settings) -> None:
         create_backend(tiny_settings)
 
 
-def test_stop_requested() -> None:
-    assert stop_requested(None) is False
-    assert stop_requested(lambda: False) is False
-    assert stop_requested(lambda: True) is True
+def test_is_stop_requested() -> None:
+    assert is_stop_requested(None) is False
+    assert is_stop_requested(lambda: False) is False
+    assert is_stop_requested(lambda: True) is True
 
 
 def test_build_stage_manager(tiny_settings: Settings, tiny_resolved: ResolvedDataset) -> None:
@@ -132,9 +141,104 @@ def test_build_stage_manager(tiny_settings: Settings, tiny_resolved: ResolvedDat
         build_stage_manager(tiny_settings, tiny_resolved, world_size=3)
 
 
+def test_configured_and_resolved_schedules_match(tiny_settings: Settings, tiny_resolved: ResolvedDataset) -> None:
+    configured = build_stage_manager(tiny_settings, tiny_resolved.config, world_size=1)
+    runtime = build_stage_manager(tiny_settings, tiny_resolved, world_size=2)
+    assert configured.boundaries == runtime.boundaries
+    assert configured.stages == [replace(stage, val_data=[]) for stage in runtime.stages]
+    assert (configured.total_steps, configured.tokens_per_step) == (runtime.total_steps, runtime.tokens_per_step)
+
+
+def test_configured_schedule_floors_each_stage_independently(tiny_settings: Settings) -> None:
+    config = load_dataset_config(tiny_settings.dataset_config)
+    for stage in config.stages:
+        stage.tokens += 1000
+    manager = build_stage_manager(tiny_settings, config, world_size=2)
+    assert [(b.start_step, b.end_step, b.transition_start_step) for b in manager.boundaries] == [
+        (0, 8, 6), (8, 16, 14), (16, 20, 20),
+    ]
+    assert manager.total_steps == 20  # flooring the sum would incorrectly give 22
+
+
+@pytest.mark.parametrize("backend_kind", ["single", "ddp_rank_0", "ddp_rank_1", "injected"])
+@pytest.mark.parametrize("tokens,warmup,cooldown,match", [
+    (10 * 1024 + 1000, 8, 8, r"warmup_steps \(8\) \+ cooldown_steps \(8\).*total optimizer steps \(10\)"),
+    (10 * 1024, 10, 0, "warmup_steps.*must be less than"),
+    (10 * 1024, 0, 10, "cooldown_steps.*must be less than"),
+    (100, 0, 0, "shorter than one optimizer step"),
+])
+def test_invalid_schedule_fails_before_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend_kind: str,
+    tokens: int, warmup: int, cooldown: int, match: str,
+) -> None:
+    # This fixture creates YAML only, without even preparing the synthetic dataset.
+    config = load_dataset_config(TINY_DATASET_YAML)
+    config.sources = {"synthetic_pretrain": config.sources["synthetic_pretrain"]}
+    config.stages = [replace(config.stages[0], tokens=tokens, transition_pct=0.0)]
+    dataset_yaml = tmp_path / "dataset.yaml"
+    dataset_yaml.write_text(json.dumps(asdict(config)))  # JSON is also valid YAML
+    settings = parse_settings(["--config", str(write_tiny_yaml(
+        tmp_path, tmp_path / "missing_dataset", tmp_path / "out", dataset_config=str(dataset_yaml),
+        stage_base_lrs=[3e-4], warmup_steps=warmup, cooldown_steps=cooldown,
+        backend="ddp" if backend_kind.startswith("ddp") else "single_device",
+    ))])
+    if backend_kind.startswith("ddp"):
+        monkeypatch.setenv("WORLD_SIZE", "2")
+        monkeypatch.setenv("RANK", backend_kind[-1])
+        monkeypatch.setenv("LOCAL_RANK", backend_kind[-1])
+    forbidden = Mock(side_effect=AssertionError("invalid schedule reached expensive startup"))
+    for name in (
+        "create_backend", "prepare_run_directory", "select_resume_for_run", "resolve_dataset",
+        "build_run_dataloaders", "build_run_model", "build_run_optimizer",
+    ):
+        monkeypatch.setattr(run_module, name, forbidden)
+    injected = Mock(spec=SingleDeviceBackend)
+    with pytest.raises(ValueError, match=match):
+        train(settings, backend=cast(SingleDeviceBackend, injected) if backend_kind == "injected" else None)
+    forbidden.assert_not_called()
+    assert injected.mock_calls == []
+    assert not Path(settings.dataset_dir).exists()
+    assert not Path(settings.out_dir).exists()
+
+
+def test_changed_stage_plan_is_rejected_before_loaders(
+    tiny_settings: Settings, tiny_resolved: ResolvedDataset, cpu_backend: SingleDeviceBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tiny_resolved.stages[0].tokens += 1024  # a valid but different runtime schedule must not silently replace preflight
+    monkeypatch.setattr(run_module, "resolve_dataset", lambda *args, **kwargs: tiny_resolved)
+    loaders = Mock(side_effect=AssertionError("changed schedule reached loaders"))
+    monkeypatch.setattr(run_module, "build_run_dataloaders", loaders)
+    with pytest.raises(ValueError, match="stage plan changed after learning-rate schedule validation"):
+        train(tiny_settings, backend=cpu_backend)
+    loaders.assert_not_called()
+    assert not (get_run_directory(tiny_settings) / "run_config.json").exists()
+
+
+def test_runtime_schedule_failure_on_a_peer_is_rejected_before_loaders(
+    tiny_settings: Settings, tiny_resolved: ResolvedDataset, cpu_backend: SingleDeviceBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = Mock(return_value=[None, ("error", "ValueError: The dataset stage plan changed")])
+
+    def resolved(*args: object, **kwargs: object) -> ResolvedDataset:
+        # Inject a peer's schedule failure after the existing coordinated dataset phases have completed.
+        monkeypatch.setattr(cpu_backend, "all_gather_object", exchange)
+        return tiny_resolved
+
+    monkeypatch.setattr(run_module, "resolve_dataset", resolved)
+    loaders = Mock(side_effect=AssertionError("peer's schedule failure reached loaders"))
+    monkeypatch.setattr(run_module, "build_run_dataloaders", loaders)
+    with pytest.raises(RuntimeError, match="learning-rate schedule validation failed on another rank.*stage plan changed"):
+        train(tiny_settings, backend=cpu_backend)
+    exchange.assert_called_once_with(None)
+    loaders.assert_not_called()
+    assert not (get_run_directory(tiny_settings) / "run_config.json").exists()
+
+
 def test_prepare_run_directory_creates_dirs_and_record_run_config_writes_the_record(tiny_settings: Settings) -> None:
     run_directory = prepare_run_directory(tiny_settings)
-    assert run_directory == Path(tiny_settings.out_dir) / "tiny" == run_directory_of(tiny_settings)
+    assert run_directory == Path(tiny_settings.out_dir) / "tiny" == get_run_directory(tiny_settings)
     assert checkpoint_dir(run_directory).is_dir()
     assert not (run_directory / "run_config.json").exists(), "written only for a FRESH run, by record_run_config"
     record_run_config(tiny_settings, run_directory)
@@ -146,14 +250,14 @@ def test_train_refuses_a_run_directory_another_run_holds(
     tiny_settings: Settings, cpu_backend: SingleDeviceBackend
 ) -> None:
     """
-    `train()` takes the `out_dir` lock right after creating the run directory and holds it for the whole run: a
-    second run pointed at the same `out_dir` fails before it resolves the dataset, instead of sharing checkpoints,
+    `train()` takes the `out_dir/run_name` lock right after creating the run directory and holds it for the whole run: a
+    second run pointed at the same run directory fails before it resolves the dataset, instead of sharing checkpoints,
     `train.log` and `run_config.json` with the first one.
     """
 
-    with run_lock(Path(tiny_settings.out_dir) / TRAIN_LOCK_NAME, "training"), pytest.raises(RunLocked, match="one is already running"):
+    with run_lock(get_run_directory(tiny_settings) / TRAIN_LOCK_NAME, "training"), pytest.raises(RunLocked, match="one is already running"):
         train(tiny_settings, backend=cpu_backend)
-    assert list(checkpoint_dir(run_directory_of(tiny_settings)).glob("*.pth")) == [], "nothing ran"
+    assert list(checkpoint_dir(get_run_directory(tiny_settings)).glob("*.pth")) == [], "nothing ran"
 
 
 def test_check_sequence_lengths_nest(tiny_settings: Settings, tiny_resolved: ResolvedDataset, caplog: pytest.LogCaptureFixture) -> None:
@@ -214,22 +318,24 @@ def test_check_tokenizer_vocabulary(tiny_settings: Settings, tiny_tokenizer_dir:
         check_tokenizer_vocabulary(tokenizer, into_the_padding)
 
 
-def test_build_run_model_on_tiny(tiny_settings: Settings, tiny_resolved: ResolvedDataset, cpu_backend: SingleDeviceBackend) -> None:
+@pytest.mark.parametrize("custom_kernels", [False, True])
+def test_build_run_model_on_tiny(tiny_settings: Settings, tiny_resolved: ResolvedDataset, cpu_backend: SingleDeviceBackend, custom_kernels: bool) -> None:
     """
     The architecture yaml with `model_overwrite` applied, `ignore_index` / gradient checkpointing from the
-    settings, `model_config.json` next to the checkpoints, the model on the backend's device.
+    settings and the model on the backend's device; construction does not publish configuration.
     """
 
     tiny_settings.model_overwrite = {"n_embd": 32}
+    tiny_settings.use_custom_kernels = custom_kernels
     run_directory = prepare_run_directory(tiny_settings)
     model = build_run_model(tiny_settings, tiny_resolved, cpu_backend, run_directory)
     assert isinstance(model, RecurrentGPT)
     assert model.config.n_embd == 32 and model.config.model_max_sequence_length == 256
     assert model.ignore_index == IGNORE_INDEX
+    assert model.config.use_custom_kernels is custom_kernels
     assert model.gradient_checkpointing == tiny_settings.gradient_checkpointing
     assert all(p.device == cpu_backend.device for p in model.parameters())
-    written = json.loads((run_directory / "model_config.json").read_text())
-    assert written == model.config.to_dict() and written["n_embd"] == 32
+    assert not (run_directory / "model_config.json").exists()
     tiny_settings.model_overwrite = {"model_max_sequence_length": 128}
     with pytest.raises(ValueError, match="training_max_sequence_length 256 .* must be at most model_max_sequence_length 128 "):
         build_run_model(tiny_settings, tiny_resolved, cpu_backend, run_directory)
@@ -306,6 +412,7 @@ def test_restore_refuses_a_checkpoint_of_another_world_size(
         settings=asdict(tiny_settings),
         model_config=tiny_model.config.to_dict(),
         dataset_config_hash=tiny_resolved.config_hash,
+        dataset_build_id=tiny_resolved.dataset_build_id,
         validation_rows=tiny_resolved.validation_rows,
         source_rows=tiny_resolved.source_rows,
         data_stream={"consumed_rows": {}, "pool_loaded": {}, "pool_target": {}, "buffers": {}, "pool": []},
@@ -342,8 +449,10 @@ def test_non_finite_loss_terminates(
 
     def nan_forward(self: RecurrentGPT, *args: Any, **kwargs: Any) -> Any:
         out = forward(self, *args, **kwargs)
-        assert out["loss"] is not None
-        out["loss"] = out["loss"] * torch.tensor(float("nan"))
+        objective = "loss_sum" if kwargs.get("return_loss_statistics") else "loss"
+        objective_loss = out[objective]
+        assert objective_loss is not None
+        out[objective] = objective_loss * torch.tensor(float("nan"))
         return out
 
     monkeypatch.setattr(RecurrentGPT, "forward", nan_forward)
@@ -366,8 +475,10 @@ def test_non_finite_loss_after_the_first_step_checkpoints_the_model_before_it(
     def nan_forward_at_step_3(self: RecurrentGPT, *args: Any, **kwargs: Any) -> Any:
         out = forward(self, *args, **kwargs)
         if self.step == 3:
-            assert out["loss"] is not None
-            out["loss"] = out["loss"] * torch.tensor(float("nan"))
+            objective = "loss_sum" if kwargs.get("return_loss_statistics") else "loss"
+            objective_loss = out[objective]
+            assert objective_loss is not None
+            out[objective] = objective_loss * torch.tensor(float("nan"))
         return out
 
     monkeypatch.setattr(RecurrentGPT, "forward", nan_forward_at_step_3)
@@ -400,8 +511,10 @@ def test_non_finite_loss_writes_a_failed_checkpoint_beside_the_regular_one(
     def nan_forward_at_step_3(self: RecurrentGPT, *args: Any, **kwargs: Any) -> Any:
         out = forward(self, *args, **kwargs)
         if self.step == 3:
-            assert out["loss"] is not None
-            out["loss"] = out["loss"] * torch.tensor(float("nan"))
+            objective = "loss_sum" if kwargs.get("return_loss_statistics") else "loss"
+            objective_loss = out[objective]
+            assert objective_loss is not None
+            out[objective] = objective_loss * torch.tensor(float("nan"))
         return out
 
     monkeypatch.setattr(RecurrentGPT, "forward", nan_forward_at_step_3)
@@ -440,7 +553,7 @@ def test_non_finite_loss_writes_a_failed_checkpoint_beside_the_regular_one(
             resume=True,
             resume_checkpoint_path=str(checkpoint),
         )
-        report = _run(resumed_yaml, cpu_backend, should_stop=lambda: True)  # one step, then the stop checkpoint
+        report = _run(resumed_yaml, cpu_backend, should_stop=StopAfterSteps(monkeypatch, 1))  # one completed step, then stop
         assert report.resumed_from == checkpoint and report.completed_steps == 4
         return stream_of(checkpoint_dir(resumed_out / "tiny") / "step-00000004-tiny.pth")
 
@@ -495,7 +608,7 @@ def full_run(tmp_path_factory: pytest.TempPathFactory, tiny_dataset_dir: Path) -
     resolved = resolve_dataset(settings)
     return {
         "out_dir": out_dir,
-        "run_dir": run_directory_of(settings),
+        "run_dir": get_run_directory(settings),
         "yaml": yaml_path,
         "report": report,
         "history": report.history,
@@ -532,6 +645,7 @@ def test_tiny_multistage_run_finishes_and_writes_checkpoints(full_run: dict[str,
         assert len(extra["rng_states"]) == 1 and set(extra["rng_states"][0]) >= {"python", "torch"}
         assert extra["model_config"]["model_max_sequence_length"] == 256 and extra["model_config"]["mean_recurrence"] == [2, 2]
         assert extra["dataset_config_hash"] == full_run["dataset_hash"]
+        assert isinstance(extra["dataset_build_id"], str) and extra["dataset_build_id"]
         assert extra["validation_rows"] == validation_rows
 
 
@@ -654,6 +768,8 @@ def test_export_to_hf_produces_loadable_folder(full_run: dict[str, Any]) -> None
     assert (export_dir / "config.json").exists() and (export_dir / "model.safetensors").exists()
     model = AutoModelForCausalLM.from_pretrained(export_dir, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(export_dir)
+    for name in ("bos_token_id", "eos_token_id", "pad_token_id"):
+        assert getattr(model.config, name) == getattr(model.generation_config, name) == getattr(tokenizer, name)
     ids = tokenizer("tok_1 tok_2 tok_3", return_tensors="pt").input_ids
     with torch.no_grad():
         out = model(input_ids=ids)
@@ -708,7 +824,7 @@ def test_resume_keeps_the_original_run_config_json(full_run: dict[str, Any], tmp
     (checkpoint_dir(run_dir) / "step-00000020-tiny.pth").unlink()
     original = json.loads((run_dir / "run_config.json").read_text())
     assert original["log_step_interval"] != 4
-    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, resume=True, export_to_hf=False, log_step_interval=4)
+    yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, out_dir, resume=True, export_to_hf=False, log_step_interval=4, log_gradient_metrics_interval=8)
     _run(yaml_path)  # log_step_interval is not numerics-relevant: the resume runs
     assert json.loads((run_dir / "run_config.json").read_text()) == original
 
@@ -903,7 +1019,9 @@ def test_resume_from_explicit_checkpoint_path(full_run: dict[str, Any], tmp_path
     ]
     for name in ("run_config.json", "model_config.json", TRAIN_LOG_NAME, TRAIN_REPORT_NAME):
         assert (fresh_dir / name).is_file(), name
-    assert json.loads((fresh_dir / "run_config.json").read_text())["resume_checkpoint_path"] == str(ckpt)
+    recorded = json.loads((fresh_dir / "run_config.json").read_text())
+    assert recorded["resume_checkpoint_path"] == torch.load(ckpt, weights_only=False)["settings"]["resume_checkpoint_path"]
+    assert recorded["_provenance"]["source_checkpoint"] == str(ckpt.resolve())
 
 
 @pytest.mark.slow
@@ -981,24 +1099,28 @@ def _short_yaml(tmp_path: Path, tiny_dataset_dir: Path, out_dir: Path, **overrid
     )
 
 
-class StopAfterPolls:
-    """
-    A `StopCheck` that says stop from its n-th poll on; `train()` polls once per completed optimizer step, so
-    `StopAfterPolls(5)` stops the run after step 5.
-    """
+class StopAfterSteps:
+    """Latch a request from a completed-step hook, independently of the number of safe-boundary polls."""
 
-    def __init__(self, polls: int) -> None:
-        self.polls = polls
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, steps: int) -> None:
+        self.steps = steps
         self.count = 0
+        step = run_one_optimizer_step
+
+        def counted(*args: Any, **kwargs: Any) -> Any:
+            result = step(*args, **kwargs)
+            self.count += 1
+            return result
+
+        monkeypatch.setattr(loop_helpers, "run_one_optimizer_step", counted)
 
     def __call__(self) -> bool:
-        self.count += 1
-        return self.count >= self.polls
+        return self.count >= self.steps
 
 
 @pytest.mark.slow
 def test_stop_request_saves_a_checkpoint_and_the_run_resumes_from_it(
-    tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
 ) -> None:
     """
     A stop request after step 2 (inside stage 0 of the 13-step config): the loop saves `step-00000002-tiny.pth`,
@@ -1009,9 +1131,9 @@ def test_stop_request_saves_a_checkpoint_and_the_run_resumes_from_it(
     out_dir = tmp_path / "out"
     run_dir = out_dir / "tiny"
     yaml_path = _short_yaml(tmp_path, tiny_dataset_dir, out_dir, export_to_hf=True)
-    should_stop = StopAfterPolls(2)
+    should_stop = StopAfterSteps(monkeypatch, 2)
     report = train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, should_stop=should_stop, keep_history=True)
-    assert should_stop.count == 2  # polled once per completed step, nothing before the loop
+    assert should_stop.count == 2  # two completed steps, regardless of boundary polling
     assert report.stopped is True
     assert (report.steps_this_process, report.completed_steps, report.resumed_from) == (2, 2, None)
     assert sorted(report.history) == [1, 2]
@@ -1037,7 +1159,7 @@ def test_stop_request_saves_a_checkpoint_and_the_run_resumes_from_it(
 
 @pytest.mark.slow
 def test_stop_request_at_a_checkpoint_step_saves_once(
-    tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
 ) -> None:
     """
     A stop request after step 4 of the 13-step config, the step the stage-0 end checkpoint is written at: that
@@ -1047,7 +1169,7 @@ def test_stop_request_at_a_checkpoint_step_saves_once(
     out_dir = tmp_path / "out"
     run_dir = out_dir / "tiny"
     yaml_path = _short_yaml(tmp_path, tiny_dataset_dir, out_dir)
-    report = train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, should_stop=StopAfterPolls(4))
+    report = train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, should_stop=StopAfterSteps(monkeypatch, 4))
     assert report.stopped and report.completed_steps == 4
     assert [p.name for p in report.checkpoints_written] == ["step-00000004-tiny-stage-0_end.pth"]
     assert sorted(p.name for p in checkpoint_dir(run_dir).glob("*.pth")) == ["step-00000004-tiny-stage-0_end.pth"]
@@ -1089,7 +1211,8 @@ def test_golden_tiny_run(reference_run: ReferenceRun) -> None:
 
 @pytest.mark.slow
 def test_resume_chain_reproduces_the_uninterrupted_run(
-    reference_run: ReferenceRun, tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend
+    reference_run: ReferenceRun, tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     One run stopped after step 5 (a plain step of stage 0), resumed and stopped after step 7 (inside the 0 -> 1
@@ -1105,12 +1228,23 @@ def test_resume_chain_reproduces_the_uninterrupted_run(
     stops = [5, 7, 14, 20]  # the last segment runs to the end
     yaml_path = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", precision="32", export_to_hf=False)
     with single_thread_deterministic():
-        segments = [train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, should_stop=StopAfterPolls(5), keep_history=True)]
+        segments = [train(parse_settings(["--config", str(yaml_path)]), backend=cpu_backend, should_stop=StopAfterSteps(monkeypatch, 5), keep_history=True)]
+        from model.layers import init as init_module
+        def unexpected_orthogonal(*args: object, **kwargs: object) -> None:
+            raise AssertionError("resume must not initialize orthogonal weights")
+        monkeypatch.setattr(init_module, "trunc_orthogonal_", unexpected_orthogonal)
+        selections = []
+        find_checkpoint = find_latest_checkpoint
+        def select_once(directory: Path, name: str) -> Path | None:
+            selections.append((directory, name))
+            return find_checkpoint(directory, name)
+        monkeypatch.setattr(checkpoint_helpers, "find_latest_checkpoint", select_once)
         resumed_yaml = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", precision="32", export_to_hf=False, resume=True)
         for previous, stop in zip(stops, stops[1:]):
-            should_stop = StopAfterPolls(stop - previous) if stop < 20 else None
+            should_stop = StopAfterSteps(monkeypatch, stop - previous) if stop < 20 else None
             segments.append(train(parse_settings(["--config", str(resumed_yaml)]), backend=cpu_backend, should_stop=should_stop, keep_history=True))
 
+    assert len(selections) == 3  # one selection per resume, reused after model construction
     assert [segment.completed_steps for segment in segments] == stops
     assert [segment.stopped for segment in segments] == [True, True, True, False]
     assert [sorted(segment.history) for segment in segments] == [[1, 2, 3, 4, 5], [6, 7], list(range(8, 15)), list(range(15, 21))]
@@ -1131,7 +1265,10 @@ def test_resume_chain_reproduces_the_uninterrupted_run(
             assert metrics["grad_norm"] == full[done]["grad_norm"], done
             assert metrics["lr"] == full[done]["lr"], done
             for key in (k for k in full[done] if k.startswith("val_loss")):
-                assert metrics[key] == full[done][key], (done, key)
+                if segment.stopped and done == segment.completed_steps:
+                    assert key not in metrics  # a request during this step now skips its due validation
+                else:
+                    assert metrics[key] == full[done][key], (done, key)
 
 
 @pytest.mark.slow
@@ -1186,7 +1323,7 @@ def test_packed_tiny_run_finishes_and_resumes_exactly(
 
 @pytest.mark.slow
 def test_plain_resume_picks_the_newest_file_over_an_abandoned_higher_step(
-    full_run: dict[str, Any], tmp_path: Path, tiny_dataset_dir: Path
+    monkeypatch: pytest.MonkeyPatch, full_run: dict[str, Any], tmp_path: Path, tiny_dataset_dir: Path
 ) -> None:
     """
     An explicit resume from step 6 into a directory that still holds steps 14 and 20 writes step 9 and stops; the
@@ -1202,7 +1339,7 @@ def test_plain_resume_picks_the_newest_file_over_an_abandoned_higher_step(
     redo_yaml = write_tiny_yaml(
         tmp_path / "redo", tiny_dataset_dir, out_dir, resume=True, resume_checkpoint_path=str(step6), export_to_hf=False
     )
-    redo = _run(redo_yaml, should_stop=StopAfterPolls(3))
+    redo = _run(redo_yaml, should_stop=StopAfterSteps(monkeypatch, 3))
     assert redo.stopped and redo.completed_steps == 9 and redo.resumed_from == step6
     assert [p.name for p in redo.checkpoints_written] == ["step-00000009-tiny.pth"]
 
@@ -1235,9 +1372,9 @@ def test_resume_with_changed_optim_config_is_refused_even_when_settings_changes_
     original = parse_settings(["--config", str(yaml_path)]).optim_config.weight_decay
     changed = parse_settings(["--config", str(yaml_path), "--optim_config.weight_decay", str(original * 2 + 0.01)])
     with pytest.raises(ValueError, match="resuming with changed optimizer hyperparameters") as excinfo:
-        train(changed)
+        train(changed, backend=SingleDeviceBackend(device="cpu", precision=changed.precision))
     assert "weight_decay" in str(excinfo.value) and "allow_settings_change cannot override" in str(excinfo.value)
-    report = train(parse_settings(["--config", str(yaml_path)]), keep_history=True)
+    report = _run(yaml_path)
     assert sorted(report.history) == list(range(15, 21))
 
 
@@ -1265,10 +1402,10 @@ def test_resume_from_the_final_checkpoint_runs_no_step_and_exports_again(
 
 
 @pytest.mark.slow
-# A plain skip, not `@pytest.mark.gpu`, on purpose: the marker would put this test into the `gpu` xdist group, whose
-# worker is already the longest; the tiny model leaves the device room to share (about 300 MiB at peak).
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
-def test_gpu_resume_with_compile_and_bf16_restores_the_state_and_finishes(tmp_path: Path, tiny_dataset_dir: Path) -> None:
+@pytest.mark.gpu
+def test_gpu_resume_with_compile_and_bf16_restores_the_state_and_finishes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tiny_dataset_dir: Path,
+) -> None:
     """
     The real run path (settings backend on CUDA, bf16 autocast, `compile_model`): a run stopped after step 5 leaves
     a checkpoint whose model and optimizer tensors are what a fresh setup restores from it, and the resumed run
@@ -1286,7 +1423,7 @@ def test_gpu_resume_with_compile_and_bf16_restores_the_state_and_finishes(tmp_pa
         tmp_path, tiny_dataset_dir, out_dir, precision="bf16-mixed", compile_model=True, export_to_hf=False,
         model_overwrite={"n_layers_in_prelude": 1, "n_layers_in_recurrent_block": [1, 1], "mean_recurrence": [1, 1], "mean_backprop_depth": [1, 1]},
     )
-    stopped = train(parse_settings(["--config", str(yaml_path)]), should_stop=StopAfterPolls(5), keep_history=True)
+    stopped = train(parse_settings(["--config", str(yaml_path)]), should_stop=StopAfterSteps(monkeypatch, 5), keep_history=True)
     assert stopped.stopped and stopped.completed_steps == 5
     checkpoint = checkpoint_dir(run_dir) / "step-00000005-tiny.pth"
     assert stopped.checkpoints_written == [checkpoint]
@@ -1365,14 +1502,13 @@ def test_samples_during_and_after_training_leave_the_numerics_unchanged(
 
 
 @pytest.mark.slow
-def test_benchmarks_during_training_use_the_harness_and_survive_its_failure(
+def test_benchmarks_during_training_publish_results_and_propagate_failure(
     tmp_path: Path, tiny_dataset_dir: Path, cpu_backend: SingleDeviceBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
     With a stubbed lm_eval, on the 13-step config: benchmarks every 10 steps and at the end write
     `benchmarks/step-XXXXXXXX.json`, the scores reach the report, the JSON report and the log; a harness that raises
-    at every step leaves the run going on with a warning and no scores (three steps, then a stop request: the
-    failure at steps 1 and 2 did not end the run).
+    during a requested evaluation terminates the run without publishing partial scores.
     """
 
     from evaluation.benchmarks import flatten_results
@@ -1400,11 +1536,9 @@ def test_benchmarks_during_training_use_the_harness_and_survive_its_failure(
         tmp_path / "failing", tiny_dataset_dir, tmp_path / "failing" / "out", export_to_hf=False,
         sample_at_training_progress=[], benchmark_step_interval=1, benchmark_at_training_progress=[], benchmark_tasks=["arc_easy"],
     )
-    failing = train(parse_settings(["--config", str(failing_yaml)]), backend=cpu_backend, should_stop=StopAfterPolls(3), keep_history=True)
-    assert failing.completed_steps == 3 and failing.last_benchmarks == {} and failing.stopped
+    with pytest.raises(RuntimeError, match="no network"):
+        train(parse_settings(["--config", str(failing_yaml)]), backend=cpu_backend, keep_history=True)
     assert not (tmp_path / "failing" / "out" / "tiny" / "benchmarks").exists()
-    log_text = (tmp_path / "failing" / "out" / "tiny" / TRAIN_LOG_NAME).read_text()
-    assert log_text.count("benchmark evaluation failed: no network") == 2  # steps 1 and 2; the stop skips step 3's
 
 
 def test_evaluation_recurrences_must_match_the_architecture_before_anything_runs(tmp_path: Path, tiny_dataset_dir: Path) -> None:
@@ -1421,3 +1555,159 @@ def test_evaluation_recurrences_must_match_the_architecture_before_anything_runs
     yaml_path = write_tiny_yaml(tmp_path / "b", tiny_dataset_dir, out_dir, benchmark_recurrences=[[1]])
     with pytest.raises(ValueError, match=r"benchmark_recurrences\[0\]"):
         train(parse_settings(["--config", str(yaml_path)]))
+
+
+@pytest.mark.parametrize("gradient_interval", [0, 8])
+def test_basic_logs_every_step_with_sparse_or_disabled_gradient_metrics(
+    tmp_path: Path, tiny_dataset_dir: Path, gradient_interval: int,
+) -> None:
+    """
+    Every cheap log reaches history; expensive metrics appear only at their interval, never forced at the final step.
+    """
+
+    path = write_tiny_yaml(tmp_path, tiny_dataset_dir, tmp_path / "out", log_step_interval=1,
+                           log_gradient_metrics_interval=gradient_interval, precision="32")
+    report = _run(path, backend=SingleDeviceBackend(device="cpu", precision="32"))
+    assert sorted(report.history) == list(range(1, 21))
+    for completed, metrics in report.history.items():
+        assert "loss" in metrics and "lr" in metrics and "grad_norm" in metrics
+        due = gradient_interval > 0 and completed % gradient_interval == 0
+        assert ("l2_param_norm" in metrics) == due
+        assert ("query_grad_0" in metrics) == due
+    assert "l2_param_norm" not in report.history[20]
+
+
+def test_resume_model_build_skips_orthogonal_and_restores_weights(
+    tiny_settings: Settings, tiny_resolved: ResolvedDataset, cpu_backend: SingleDeviceBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from model.layers import init as init_module
+    directory = prepare_run_directory(tiny_settings)
+    original = cpu_backend.plain_model(build_run_model(tiny_settings, tiny_resolved, cpu_backend, directory))
+    def unexpected(*args: object, **kwargs: object) -> None:
+        raise AssertionError('orthogonal initialization must be skipped')
+    monkeypatch.setattr(init_module, 'trunc_orthogonal_', unexpected)
+    model = cpu_backend.plain_model(build_run_model(
+        tiny_settings, tiny_resolved, cpu_backend, directory, resume_checkpoint=directory / 'selected.pth',
+    ))
+    assert model.lm_head.weight is model.transformer.wte.weight
+    assert model.freqs_cis.dtype == torch.float32 and torch.equal(model.freqs_cis, original.freqs_cis)
+    assert torch.count_nonzero(model.transformer.wte.weight) == 0
+    model.load_state_dict(original.state_dict(), strict=True)
+    assert model.state_dict().keys() == original.state_dict().keys()
+    for key, expected in original.state_dict().items():
+        assert torch.equal(model.state_dict()[key], expected), key
+
+
+def test_resume_without_checkpoint_keeps_fresh_initialization(
+    tiny_settings: Settings, tiny_resolved: ResolvedDataset, cpu_backend: SingleDeviceBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from model.layers import init as init_module
+    directory = prepare_run_directory(tiny_settings)
+    tiny_settings.resume = True
+    selected = checkpoint_helpers.resolve_resume_checkpoint(tiny_settings, directory)
+    assert selected is None
+    calls = []
+    original = init_module.trunc_orthogonal_
+    def record(tensor: torch.Tensor, gain: float = 1.0) -> torch.Tensor:
+        calls.append(1)
+        return original(tensor, gain)
+    monkeypatch.setattr(init_module, 'trunc_orthogonal_', record)
+    build_run_model(tiny_settings, tiny_resolved, cpu_backend, directory, resume_checkpoint=selected)
+    assert calls
+
+
+def test_missing_explicit_checkpoint_fails_before_model_build(
+    tiny_settings: Settings, cpu_backend: SingleDeviceBackend, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tiny_settings.resume = True
+    tiny_settings.resume_checkpoint_path = str(Path(tiny_settings.out_dir) / 'missing.pth')
+    def unexpected(*args: object, **kwargs: object) -> None:
+        raise AssertionError('model should not be built')
+    monkeypatch.setattr(run_module, 'build_run_model', unexpected)
+    with pytest.raises(FileNotFoundError, match='resume checkpoint'):
+        train(tiny_settings, backend=cpu_backend)
+
+
+
+def test_dataset_conflict_precedes_resolution_and_model_setup(
+    tiny_settings: Settings, cpu_backend: SingleDeviceBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    called: list[str] = []
+    monkeypatch.setattr(run_module, "resolve_dataset", lambda *a, **k: called.append("resolve"))
+    monkeypatch.setattr(run_module, "build_run_model", lambda *a, **k: called.append("model"))
+    with build_lock(Path(tiny_settings.dataset_dir)), pytest.raises(RunLocked):
+        train(tiny_settings, backend=cpu_backend)
+    assert called == []
+    with run_lock(get_run_directory(tiny_settings) / TRAIN_LOCK_NAME, "training"):
+        pass  # dataset refusal also releases the output lock
+
+
+@pytest.mark.parametrize("auto_prepare", [False, True])
+def test_training_lock_scope_and_dataset_mode(
+    tiny_settings: Settings, cpu_backend: SingleDeviceBackend, auto_prepare: bool,
+) -> None:
+    from dataclasses import replace
+    from training.execution.lifecycle import open_training_dataset
+
+    tiny_settings.auto_prepare = auto_prepare
+    other = replace(tiny_settings, run_name="independent", auto_prepare=False)
+    with open_training_dataset(tiny_settings, cpu_backend, None):
+        with pytest.raises(RunLocked), open_training_dataset(tiny_settings, cpu_backend, None):
+            pass  # the same run remains exclusive, even when its dataset is shared
+        if auto_prepare:
+            with pytest.raises(RunLocked), open_training_dataset(other, cpu_backend, None):
+                pass  # even prepared data stays exclusive when auto-prepare is enabled
+        else:
+            with (
+                open_training_dataset(other, cpu_backend, None),
+                pytest.raises(RunLocked), build_lock(Path(tiny_settings.dataset_dir)),
+            ):
+                pass
+            with pytest.raises(RunLocked), build_lock(Path(tiny_settings.dataset_dir)):
+                pass  # closing the second run did not release the first run's protection
+    with build_lock(Path(tiny_settings.dataset_dir)):
+        pass
+
+
+@pytest.mark.parametrize("overwrite,field", [
+    ({"tie_embeddings": "false"}, "tie_embeddings"),
+    ({"qk_bias": 1}, "qk_bias"),
+    ({"norm_eps": float("nan")}, "norm_eps"),
+    ({"rope_settings": {"rope_base": float("inf")}}, "rope_base"),
+])
+@pytest.mark.parametrize("source", ["architecture", "override"])
+def test_invalid_model_config_fails_before_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overwrite: dict[str, Any], field: str, source: str,
+) -> None:
+    settings = parse_settings(["--config", str(write_tiny_yaml(
+        tmp_path, tmp_path / "missing_dataset", tmp_path / "out",
+    ))])
+    if source == "override":
+        settings.model_overwrite.update(overwrite)
+    else:
+        architecture = tmp_path / "invalid_architecture.yaml"
+        architecture.write_text(json.dumps(overwrite))
+        settings.model_architecture_config = str(architecture)
+    forbidden = Mock(side_effect=AssertionError("invalid model config reached expensive startup"))
+    monkeypatch.setattr(setup_helpers, "RecurrentGPT", forbidden)
+    for name in ("create_backend", "resolve_dataset", "build_run_model", "build_run_dataloaders"):
+        monkeypatch.setattr(run_module, name, forbidden)
+    with pytest.raises(ValueError, match=field):
+        train(settings)
+    forbidden.assert_not_called()
+    assert not Path(settings.dataset_dir).exists()
+    assert not Path(settings.out_dir).exists()
+
+
+def test_build_run_model_reuses_preflight_config(
+    tiny_settings: Settings, tiny_resolved: ResolvedDataset, cpu_backend: SingleDeviceBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = check_evaluation_recurrences(tiny_settings)
+    forbidden = Mock(side_effect=AssertionError("validated architecture was read twice"))
+    monkeypatch.setattr(RecurrentConfig, "from_yaml", forbidden)
+    model = build_run_model(tiny_settings, tiny_resolved, cpu_backend, Path(tiny_settings.out_dir), model_config=config)
+    assert cpu_backend.plain_model(model).config is config
+    forbidden.assert_not_called()

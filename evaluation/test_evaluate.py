@@ -96,3 +96,41 @@ def test_cli_writes_samples_and_benchmarks_into_the_run_directory(
 
     assert main([*argv, "--no_samples", "--out_dir", str(tmp_path / "none")]) == 0
     assert not (tmp_path / "none").exists()
+
+
+def test_sample_cache_cli_default_and_legacy_override() -> None:
+    from evaluation.evaluate import parse_arguments
+
+    assert not parse_arguments(["--checkpoint", "unused.pth"]).no_sample_cache
+    assert parse_arguments(["--checkpoint", "unused.pth", "--no_sample_cache"]).no_sample_cache
+
+
+@pytest.mark.parametrize("stored,override,expected", [("bf16-mixed", None, "bf16-mixed"),
+                                                       ("bf16-mixed", "32", "32"), (None, None, None)])
+def test_checkpoint_precision_reaches_both_entry_points(
+    checkpoint: Path, monkeypatch: pytest.MonkeyPatch, stored: str | None, override: str | None, expected: str | None,
+) -> None:
+    from typing import Any
+    from model.execution import ExecutionPolicy
+
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if stored is not None:
+        state["settings"]["precision"] = stored
+    torch.save(state, checkpoint)
+    calls: list[ExecutionPolicy] = []
+
+    def samples(*args: Any, **kwargs: Any) -> list[Any]:
+        calls.append(kwargs["execution_policy"])
+        return []
+
+    def benchmarks(*args: Any, **kwargs: Any) -> dict[str, float]:
+        calls.append(kwargs["execution_policy"])
+        return {}
+
+    monkeypatch.setattr("evaluation.cli.commands.generate_and_save_samples", samples)
+    monkeypatch.setattr("evaluation.cli.commands.evaluate_on_benchmarks", benchmarks)
+    argv = ["--checkpoint", str(checkpoint), "--device", "cpu", "--tasks", "offline"]
+    if override is not None:
+        argv.extend(["--precision", override])
+    assert main(argv) == 0
+    assert calls == [ExecutionPolicy(expected), ExecutionPolicy(expected)]

@@ -24,7 +24,8 @@ from model import RecurrentGPT
 from training.backend import get_backend
 from training.backend.base import Backend
 from training.backend.ddp import DDP_TIMEOUT, TORCHRUN_VARIABLES, DDPBackend
-from training.run import run_directory_of, train
+from training.execution import get_run_directory
+from training.run import train
 from training.settings import parse_settings
 from training.testing.network import free_port
 from training.testing.golden import (
@@ -186,7 +187,7 @@ def test_golden_tiny_run_through_the_ddp_backend(torchrun_env: None, tiny_datase
         settings = parse_settings(["--config", str(yaml_path)])
         assert settings.backend == "ddp"
         report = train(settings, backend=DDPBackend(device="cpu", precision="32"), keep_history=True)
-    reference = ReferenceRun(report.history, yaml_path, run_directory_of(settings))
+    reference = ReferenceRun(report.history, yaml_path, get_run_directory(settings))
     expected = json.loads(GOLDEN_RUN_PATH.read_text())
     actual = reference_metrics(reference)
     assert actual["optimizer_steps"] == 19

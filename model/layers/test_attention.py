@@ -20,6 +20,8 @@ from model.layers.attention import (
     attention_sdpa,
     document_attention_mask,
     precompute_freqs_cis,
+    qk_bias_rope,
+    qkv_bias_rope,
 )
 from model.config import RecurrentConfig
 from model.test_config import tiny_config
@@ -81,6 +83,29 @@ def test_forward_shape_and_parameters() -> None:
     assert attn.Wqkv.weight.shape == (3 * cfg.n_embd, cfg.n_embd)
     assert attn.qk_bias.shape == (2, 1, cfg.num_attention_heads, cfg.head_size)
     assert torch.equal(attn.qk_bias, torch.zeros_like(attn.qk_bias))
+
+
+@pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize('with_bias', [False, True])
+def test_qkv_hook_preserves_values_gradients_and_v_storage(dtype: torch.dtype, with_bias: bool) -> None:
+    torch.manual_seed(81)
+    qkv = torch.randn(2, 7, 3 * 32, dtype=dtype, requires_grad=True)
+    bias = torch.randn(2, 1, 4, 8, requires_grad=True) if with_bias else None
+    freqs = precompute_freqs_cis(8, 7, 10000.0)
+    q, k, v = qkv.split(32, dim=2)  # type: ignore[no-untyped-call]  # torch stub gap
+    q, k = qk_bias_rope(bias, q.view(2, 7, 4, 8), k.view(2, 7, 4, 8), freqs)
+    expected = (q, k, v.view(2, 7, 4, 8))
+    actual = qkv_bias_rope(bias, qkv, freqs, 4)
+    for got, wanted in zip(actual, expected, strict=True):
+        torch.testing.assert_close(got, wanted, atol=0, rtol=0)
+    assert actual[2].untyped_storage().data_ptr() == qkv.untyped_storage().data_ptr()
+    assert actual[2].stride() == expected[2].stride()
+    tangents = tuple(torch.randn_like(value) for value in expected)
+    inputs = (qkv,) if bias is None else (qkv, bias)
+    reference_grads = torch.autograd.grad(expected, inputs, tangents)
+    actual_grads = torch.autograd.grad(actual, inputs, tangents)
+    for got, wanted in zip(actual_grads, reference_grads, strict=True):
+        torch.testing.assert_close(got, wanted, atol=0, rtol=0)
 
 
 def test_causality_perturbing_token_t_leaves_earlier_outputs_unchanged() -> None:

@@ -5,13 +5,24 @@ Tests for the parameter-group split, `build_optimizer`/`set_lr` and hand-checked
 
 import copy
 import math
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 import torch
 
 from model import RecurrentGPT
-from training.optim import ELLISAdam, _single_tensor_modded_adamw, build_optimizer, get_param_groups, set_lr
+from training.optim import (
+    STATE_8BIT_BLOCK_SIZE,
+    STATE_8BIT_MIN_NUMEL,
+    ELLISAdam,
+    ELLISAdam8bit,
+    _single_tensor_modded_adamw,
+    build_optimizer,
+    dequantized_state,
+    get_param_groups,
+    is_quantized_state,
+    set_lr,
+)
 from training.settings import OptimizerConfig
 
 
@@ -382,7 +393,7 @@ def test_cpu_update_stays_eager_and_scalars_come_as_tensors() -> None:
     coefficients handed to it are 0-d float32 tensors, the form that keeps the compiled path free of recompiles.
     """
 
-    from training import optim
+    from training.optim import update as optim
 
     p = torch.nn.Parameter(torch.tensor([1.0, -2.0]))
     p.grad = torch.tensor([0.5, 0.25])
@@ -404,14 +415,14 @@ def test_cpu_update_stays_eager_and_scalars_come_as_tensors() -> None:
         assert all(t.device.type == "cpu" and t.dtype == torch.float32 and t.ndim == 0 for t in seen[key]), key
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled update is built for CUDA only")
+@pytest.mark.gpu
 def test_compiled_cuda_update_matches_eager_at_rounding_level() -> None:
     """
     The `torch.compile`d group update on CUDA reproduces the eager kernel to fp32 rounding (Inductor fuses and may
     reorder the elementwise chain), across LR changes without a recompile, for every option combination.
     """
 
-    from training import optim
+    from training.optim import update as optim
 
     for flags in (
         dict(update_clipping=True, atan_adam=True, running_init=True),
@@ -436,3 +447,341 @@ def test_compiled_cuda_update_matches_eager_at_rounding_level() -> None:
             results.append((p.detach().clone(), opt.state[p]["exp_avg"].clone(), opt.state[p]["exp_avg_sq"].clone()))
         for eager, fused in zip(*results, strict=True):
             torch.testing.assert_close(fused, eager, rtol=1e-6, atol=1e-7)  # a few fp32 ulps
+
+
+# ELLISAdam8bit: the same update on 8-bit block-quantised moments, embeddings pinned to fp32
+
+
+def _production_ellis_config() -> OptimizerConfig:
+    return OptimizerConfig(
+        lr=1e-3, weight_decay=0.1, betas=(0.9, 0.95), update_clipping=True, atan_adam=True, running_init=True
+    )
+
+
+def _flat_params(model: torch.nn.Module) -> torch.Tensor:
+    return torch.cat([p.detach().flatten().clone() for p in model.parameters()])
+
+
+def _same_random_grads(models: list[torch.nn.Module], generator: torch.Generator, scale: float = 1e-2) -> None:
+    for params in zip(*(m.parameters() for m in models), strict=True):
+        grad = torch.randn(params[0].shape, generator=generator, device=params[0].device) * scale
+        for p in params:
+            p.grad = grad.clone()
+
+
+def test_ellis_adam_8bit_quantizes_matrices_only(tiny_model: RecurrentGPT) -> None:
+    """
+    After the first step the matrix group's moments are `OptimState8bit` (signed first moment, unsigned second,
+    one fp32 scale per block), the embedding group's stay fp32 although the table is large enough to quantise
+    (`build_optimizer` pins it), and the norm / bias group's stay fp32 because the tensors are below the size
+    threshold.
+    """
+
+    opt = build_optimizer("ELLISAdam8bit", get_param_groups(tiny_model, 0.1), _production_ellis_config())
+    assert isinstance(opt, ELLISAdam8bit)
+    for p in tiny_model.parameters():
+        p.grad = torch.randn_like(p)
+    opt.step()
+    matrices, embeddings, norms = opt.param_groups
+    assert (matrices["state_bits"], embeddings["state_bits"], norms["state_bits"]) == (8, 32, 8)
+    for p in matrices["params"]:
+        exp_avg, exp_avg_sq = opt.state[p]["exp_avg"], opt.state[p]["exp_avg_sq"]
+        assert is_quantized_state(exp_avg) and is_quantized_state(exp_avg_sq)
+        assert exp_avg.signed and not exp_avg_sq.signed
+        assert exp_avg.codes.dtype == torch.uint8 and exp_avg.scale.numel() == p.numel() // STATE_8BIT_BLOCK_SIZE
+        assert exp_avg.shape == p.shape and exp_avg.dtype == p.dtype
+    assert all(p.numel() >= STATE_8BIT_MIN_NUMEL for p in embeddings["params"])
+    assert all(p.numel() < STATE_8BIT_MIN_NUMEL for p in norms["params"])
+    for p in embeddings["params"] + norms["params"]:
+        for key in ("exp_avg", "exp_avg_sq"):
+            assert not is_quantized_state(opt.state[p][key]) and opt.state[p][key].dtype == torch.float32
+
+
+def _relative_update_error(
+    before32: torch.Tensor, after32: torch.Tensor, before8: torch.Tensor, after8: torch.Tensor
+) -> float:
+    update32, update8 = after32 - before32, after8 - before8
+    return float((update8 - update32).norm() / update32.norm())
+
+
+def test_update_error_excludes_existing_trajectory_offset() -> None:
+    before32 = torch.tensor([1.0, 2.0])
+    before8 = before32 + 0.5
+    update = torch.tensor([0.125, -0.25])
+    after32, after8 = before32 + update, before8 + update
+    assert _relative_update_error(before32, after32, before8, after8) == 0.0
+    assert float((after8 - after32).norm()) > 0.0
+
+
+def test_ellis_adam_8bit_follows_the_fp32_trajectory(
+    tiny_model: RecurrentGPT, record_property: Callable[[str, object], None]
+) -> None:
+    """
+    Same gradients into ELLISAdam and ELLISAdam8bit (production options, running init): every step's update
+    stays within six percent in norm (the moment type checks separately establish quantisation)
+    and the trajectories stay within one percent of the total movement of each other.
+    """
+
+    model32 = tiny_model
+    model8 = copy.deepcopy(tiny_model)
+    opt32 = build_optimizer("ELLISAdam", get_param_groups(model32, 0.1), _production_ellis_config())
+    opt8 = build_optimizer("ELLISAdam8bit", get_param_groups(model8, 0.1), _production_ellis_config())
+    theta0 = _flat_params(model32)
+    generator = torch.Generator().manual_seed(1)
+    update_errors: list[float] = []
+    for _ in range(10):
+        before32, before8 = _flat_params(model32), _flat_params(model8)
+        _same_random_grads([model32, model8], generator)
+        set_lr(opt32, 1e-3)
+        set_lr(opt8, 1e-3)
+        opt32.step()
+        opt8.step()
+        update_error = _relative_update_error(before32, _flat_params(model32), before8, _flat_params(model8))
+        update_errors.append(update_error)
+        # Retain the existing 6% accuracy ceiling; a more accurate result is always acceptable.
+        assert update_error < 0.06, update_error
+    record_property("relative_update_errors", update_errors)
+    theta32, theta8 = _flat_params(model32), _flat_params(model8)
+    trajectory_error = ((theta8 - theta32).norm() / (theta32 - theta0).norm()).item()
+    record_property("relative_trajectory_error", trajectory_error)
+    assert trajectory_error < 0.01  # measured 0.002
+    moment_errors: list[float] = []
+    for p32, p8 in zip(model32.parameters(), model8.parameters(), strict=True):
+        if is_quantized_state(opt8.state[p8]["exp_avg"]):
+            for key in ("exp_avg", "exp_avg_sq"):
+                moment32, moment8 = opt32.state[p32][key], dequantized_state(opt8.state[p8][key])
+                assert moment8.dtype == torch.float32 and not is_quantized_state(moment8)
+                moment_error = ((moment8 - moment32).norm() / moment32.norm()).item()
+                moment_errors.append(moment_error)
+                assert moment_error < 0.06  # measured 0.03 / 0.02
+    record_property("max_relative_moment_error", max(moment_errors))
+
+
+def test_ellis_adam_8bit_state_dict_round_trip(tiny_model: RecurrentGPT) -> None:
+    """
+    The quantised moments travel through `torch.save` / `torch.load` (cpu) / `Optimizer.load_state_dict` as they
+    are: the restored optimizer takes the same next step bit for bit, its state keeps the 8-bit type and its
+    groups carry `state_bits`.
+    """
+
+    import io
+
+    opt = build_optimizer("ELLISAdam8bit", get_param_groups(tiny_model, 0.1), _production_ellis_config())
+    generator = torch.Generator().manual_seed(2)
+    for _ in range(3):
+        _same_random_grads([tiny_model], generator)
+        opt.step()
+    buffer = io.BytesIO()
+    torch.save(opt.state_dict(), buffer)
+    buffer.seek(0)
+    loaded = torch.load(buffer, map_location="cpu", weights_only=False)
+    assert [group["state_bits"] for group in loaded["param_groups"]] == [8, 32, 8]
+
+    restored_model = copy.deepcopy(tiny_model)
+    restored = build_optimizer("ELLISAdam8bit", get_param_groups(restored_model, 0.1), _production_ellis_config())
+    restored.load_state_dict(loaded)
+    _same_random_grads([tiny_model, restored_model], generator)
+    set_lr(opt, 5e-4)
+    set_lr(restored, 5e-4)
+    opt.step()
+    restored.step()
+    for p, q in zip(tiny_model.parameters(), restored_model.parameters(), strict=True):
+        assert torch.equal(p, q)
+        assert is_quantized_state(opt.state[p]["exp_avg"]) == is_quantized_state(restored.state[q]["exp_avg"])
+
+
+def test_resume_refuses_switching_between_fp32_and_8bit_moments(tiny_model: RecurrentGPT) -> None:
+    """
+    `state_bits` is a parameter-group hyperparameter, so the resume check refuses a checkpoint of the other
+    optimizer in both directions (the two state layouts are not interchangeable).
+    """
+
+    from training.checkpoint import _group_hyperparameters, check_param_groups_unchanged
+
+    fp32 = build_optimizer("ELLISAdam", get_param_groups(tiny_model, 0.1), _production_ellis_config())
+    eight = build_optimizer("ELLISAdam8bit", get_param_groups(tiny_model, 0.1), _production_ellis_config())
+    with pytest.raises(ValueError, match="state_bits"):
+        check_param_groups_unchanged(_group_hyperparameters(fp32), _group_hyperparameters(eight))
+    with pytest.raises(ValueError, match="state_bits"):
+        check_param_groups_unchanged(_group_hyperparameters(eight), _group_hyperparameters(fp32))
+    check_param_groups_unchanged(_group_hyperparameters(eight), _group_hyperparameters(eight))
+
+
+def test_ellis_adam_8bit_needs_the_param_groups_and_valid_state_bits(tiny_model: RecurrentGPT) -> None:
+    with pytest.raises(ValueError, match="get_param_groups"):
+        build_optimizer("ELLISAdam8bit", tiny_model.parameters(), OptimizerConfig())
+    with pytest.raises(ValueError, match="state_bits"):
+        ELLISAdam8bit(tiny_model.parameters(), state_bits=16)
+
+
+@pytest.mark.gpu
+def test_compiled_cuda_8bit_update_matches_eager() -> None:
+    """
+    Dequantise, update and re-quantise fused by Inductor produce the same 8-bit codes as the eager path and
+    parameters within fp32 rounding, across LR changes without a recompile.
+    """
+
+    from training.optim import update as optim
+
+    results = []
+    for compiled in (False, True):
+        torch.manual_seed(0)
+        p = torch.nn.Parameter(torch.randn(64, 64, device="cuda"))  # 4096 elements: quantised
+        opt = ELLISAdam8bit(
+            [p], lr=1e-3, betas=(0.9, 0.95), weight_decay=0.1, update_clipping=True, atan_adam=True, running_init=True
+        )
+        optim._compiled_group_update = None
+        original = optim._compiled_adamw_group_update
+        if not compiled:
+            optim._compiled_adamw_group_update = lambda: optim._adamw_group_update
+        try:
+            for step in range(4):
+                p.grad = torch.randn(64, 64, device="cuda") * 1e-2
+                set_lr(opt, 1e-3 * (step + 1))
+                opt.step()
+        finally:
+            optim._compiled_adamw_group_update = original
+        state = opt.state[p]
+        assert is_quantized_state(state["exp_avg"]) and is_quantized_state(state["exp_avg_sq"])
+        results.append((p.detach().clone(), state["exp_avg"].codes.clone(), state["exp_avg_sq"].codes.clone()))
+    (eager_p, eager_m, eager_v), (fused_p, fused_m, fused_v) = results
+    torch.testing.assert_close(fused_p, eager_p, rtol=1e-6, atol=1e-6)
+    assert torch.equal(fused_m, eager_m) and torch.equal(fused_v, eager_v)
+
+
+# Constructor, explicit groups, later groups, and checkpoint metadata share the same scalar contract.
+INVALID_ELLIS_HYPERPARAMETERS: list[tuple[str, Any]] = [
+    ("betas", ()), ("betas", (0.9,)), ("betas", (0.9, 0.95, 0.99)), ("betas", "ab"),
+    ("betas", (True, 0.95)), ("betas", (0.9, "0.95")),
+    *[("betas", (bad, 0.95)) for bad in (-0.1, 1.0, float("nan"), float("inf"))],
+    *[("betas", (0.9, bad)) for bad in (-0.1, 1.0, float("nan"), float("inf"))],
+    *[(key, bad) for key in ("eps", "weight_decay")
+      for bad in (-1.0, float("nan"), float("inf"), True, "0.1", None)],
+    *[("lr", bad) for bad in (0.0, -1.0, float("nan"), float("inf"), True, "0.1")],
+]
+
+
+@pytest.mark.parametrize("cls", [ELLISAdam, ELLISAdam8bit])
+@pytest.mark.parametrize(("key", "value"), INVALID_ELLIS_HYPERPARAMETERS)
+def test_ellis_rejects_invalid_constructor_and_group_metadata(cls: type[ELLISAdam], key: str, value: Any) -> None:
+    param = torch.nn.Parameter(torch.ones(2))
+    with pytest.raises(ValueError, match=key):
+        cls([param], **{key: value})
+    with pytest.raises(ValueError, match=key):
+        cls([{"params": [param], key: value}])
+    opt = cls([param])
+    group = {"params": [torch.nn.Parameter(torch.ones(2))], key: value}
+    with pytest.raises(ValueError, match=key):
+        opt.add_param_group(group)
+    assert len(opt.param_groups) == 1 and not opt.state
+    assert set(group) == {"params", key}  # rejected input was not populated with defaults
+
+
+@pytest.mark.parametrize("cls", [ELLISAdam, ELLISAdam8bit])
+@pytest.mark.parametrize(("key", "value"), [
+    *[(key, value) for key, value in INVALID_ELLIS_HYPERPARAMETERS if not (key == "lr" and value == 0.0)],
+    ("init_lr", 0.0), ("init_lr", float("nan")), ("init_lr", True),
+])
+def test_ellis_rejects_invalid_restore_before_replacing_state(cls: type[ELLISAdam], key: str, value: Any) -> None:
+    param = torch.nn.Parameter(torch.ones(2))
+    opt = cls([param])
+    param.grad = torch.ones_like(param)
+    opt.step()
+    state = copy.deepcopy(opt.state_dict())
+    state["param_groups"][0][key] = value
+    original_group, original_state = opt.param_groups[0], opt.state[param]
+    with pytest.raises(ValueError, match=key):
+        opt.load_state_dict(state)
+    assert opt.param_groups[0] is original_group and opt.state[param] is original_state
+    assert state["param_groups"][0][key] is value  # evidence is not repaired
+
+
+@pytest.mark.parametrize("cls", [ELLISAdam, ELLISAdam8bit])
+def test_ellis_accepts_boundaries_generator_tensor_lr_and_zero_schedule(cls: type[ELLISAdam]) -> None:
+    param = torch.nn.Parameter(torch.ones(2))
+    opt = cls((p for p in [param]), lr=torch.tensor(0.1), betas=(0.0, 0.0), eps=0.0, weight_decay=0.0)
+    assert opt.param_groups[0]["params"] == [param]
+    param.grad = torch.ones_like(param)
+    set_lr(opt, 0.0)
+    opt.step()
+    assert torch.equal(param, torch.ones(2))
+    restored = cls([param])
+    restored.load_state_dict(copy.deepcopy(opt.state_dict()))
+    restored.step()
+    assert torch.equal(param, torch.ones(2))
+    assert restored.state[param]["step"].item() == 2
+    # No scalar reads added to the runtime path: a tensor LR is read only at validated entry points.
+
+
+@pytest.mark.parametrize("cls", [ELLISAdam, ELLISAdam8bit])
+@pytest.mark.parametrize("lr", [torch.tensor([0.1]), torch.tensor(float("nan")), torch.tensor(True)])
+def test_ellis_rejects_invalid_tensor_lr(cls: type[ELLISAdam], lr: torch.Tensor) -> None:
+    with pytest.raises(ValueError, match="lr"):
+        cls([torch.nn.Parameter(torch.ones(2))], lr=lr)
+
+
+@pytest.mark.parametrize("key", ["init_lr", "betas", "eps", "weight_decay"])
+def test_ellis_restore_does_not_fill_missing_metadata(key: str) -> None:
+    opt = ELLISAdam([torch.nn.Parameter(torch.ones(2))])
+    state = opt.state_dict()
+    del state["param_groups"][0][key]
+    with pytest.raises(ValueError, match=f"missing hyperparameters.*{key}"):
+        opt.load_state_dict(state)
+
+
+def test_8bit_group_state_bits_validated_before_registration_or_restore() -> None:
+    param = torch.nn.Parameter(torch.ones(2))
+    with pytest.raises(ValueError, match="state_bits"):
+        ELLISAdam8bit([{"params": [param], "state_bits": 4}])
+    opt = ELLISAdam8bit([param])
+    with pytest.raises(ValueError, match="state_bits"):
+        opt.add_param_group({"params": [torch.nn.Parameter(torch.ones(2))], "state_bits": 4})
+    state = opt.state_dict()
+    state["param_groups"][0]["state_bits"] = 4
+    with pytest.raises(ValueError, match="state_bits"):
+        opt.load_state_dict(state)
+
+
+def test_build_optimizer_revalidates_mutated_config_and_retains_native_adamw_zero_lr() -> None:
+    param = torch.nn.Parameter(torch.ones(2))
+    cfg = OptimizerConfig()
+    cfg.betas = (1.0, 0.95)
+    for name in ("AdamW", "ELLISAdam", "ELLISAdam8bit"):
+        with pytest.raises(ValueError, match="betas"):
+            build_optimizer(name, [param], cfg)
+    adamw = build_optimizer("AdamW", (p for p in [param]), OptimizerConfig(lr=0.0, eps=0.0))
+    assert type(adamw) is torch.optim.AdamW and adamw.param_groups[0]["lr"] == 0.0
+
+
+@pytest.mark.parametrize("cls", [ELLISAdam, ELLISAdam8bit])
+@pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf"), True, "0.1"])
+def test_ellis_group_reference_lr_must_stay_positive(cls: type[ELLISAdam], value: Any) -> None:
+    param = torch.nn.Parameter(torch.ones(2))
+    with pytest.raises(ValueError, match="init_lr"):
+        cls([{"params": [param], "init_lr": value}])
+    opt = cls([param])
+    with pytest.raises(ValueError, match="init_lr"):
+        opt.add_param_group({"params": [torch.nn.Parameter(torch.ones(2))], "init_lr": value})
+    assert len(opt.param_groups) == 1
+
+
+@pytest.mark.parametrize("cls", [ELLISAdam, ELLISAdam8bit])
+def test_optimizer_reorganization_preserves_public_identity_and_pickle(cls: type[ELLISAdam]) -> None:
+    import pickle
+
+    # Recorded provenance and old pickle references keep the public package path.
+    assert f"{cls.__module__}.{cls.__qualname__}" == f"training.optim.{cls.__name__}"
+    legacy_reference = f"ctraining.optim\n{cls.__name__}\n.".encode()
+    assert pickle.loads(legacy_reference) is cls
+
+    # A populated optimizer round-trips through the same class and state layout.
+    param = torch.nn.Parameter(torch.ones(4))
+    optimizer = cls([param], lr=0.1, running_init=True)
+    param.grad = torch.full_like(param, 0.5)
+    optimizer.step()
+    restored = pickle.loads(pickle.dumps(optimizer))
+    assert type(restored) is cls
+    restored_param = restored.param_groups[0]["params"][0]
+    torch.testing.assert_close(restored_param, param, rtol=0, atol=0)
+    for name in ("step", "exp_avg", "exp_avg_sq"):
+        torch.testing.assert_close(restored.state[restored_param][name], optimizer.state[param][name], rtol=0, atol=0)

@@ -58,6 +58,31 @@ def test_stage_bars_and_overall_bar(board: TrainingDashboard) -> None:
     assert StageBar("x", 0).percentage == 100.0 and StageBar("x", 4, completed=9).percentage == 100.0
 
 
+def test_micro_batch_bar_is_off_by_default_and_counts_one_step_at_a_time(clock: FakeClock) -> None:
+    """
+    `update_micro_batch` is ignored without `show_micro_batches`; with it, a bar under the overall bar shows the
+    running step's micro-batches (empty before the first report, never full from a total of 0) and `update_step`
+    resets it to 0 for the next step.
+    """
+
+    board = TrainingDashboard("run", STAGES, STEPS, TOTAL, clock=clock)
+    board.update_micro_batch(2, 4)
+    assert "micro-batches" not in board.render_text()
+
+    shown = TrainingDashboard("run", STAGES, STEPS, TOTAL, clock=clock, show_micro_batches=True)
+    text = shown.render_text()
+    assert "micro-batches" in text and "0/0" in text and "  0%" in text
+    shown.update_micro_batch(1, 4)
+    shown.update_micro_batch(3, 4)
+    text = shown.render_text()
+    assert "3/4" in text and " 75%" in text and "of step 0" in text
+    shown.update_step(1, 0, None, metrics(1))
+    assert "0/4" in shown.render_text(), "the step is done: the count starts again"
+    shown.update_micro_batch(4, 4)
+    assert "4/4" in shown.render_text() and "of step 1" in shown.render_text()
+    assert [task.completed for task in shown.tasks] == [1, 0, 1], "the stage bars are not affected"
+
+
 def test_stage_transition_moves_the_highlight(board: TrainingDashboard) -> None:
     board.update_step(18, 0, 0.5, metrics(18))
     text = board.render_text()
@@ -97,7 +122,10 @@ def test_stage_names_with_markup_characters_render_literally(clock: FakeClock) -
 
 def test_overall_bar_eta_from_the_injected_clock(board: TrainingDashboard, clock: FakeClock) -> None:
     assert "ETA —" in board.render_text() and "? steps/s" in board.render_text()
-    clock.advance(20)
+    clock.advance(4)
+    board.update_step(2, 0, None, metrics(2))
+    assert "ETA —" in board.render_text()
+    clock.advance(16)
     board.update_step(10, 0, None, metrics(10))  # 2 s/step, 20 steps left
     text = board.render_text()
     assert "0.50 steps/s" in text and "0:00:20 elapsed" in text and "ETA 0:00:40" in text
@@ -118,6 +146,17 @@ def test_metrics_table_shows_the_latest_step(board: TrainingDashboard) -> None:
     assert board.latest_metrics["loss"] == 2.5
 
 
+def test_recurrence_metrics_order_and_retention(board: TrainingDashboard) -> None:
+    board.update_step(4, 0, None, metrics(4, token_correlation=.9876, token_dispersion=.0012, state_sensitivity=.034))
+    text = board.render_text()
+    assert text.index('grad norm') < text.index('tok corr') < text.index('tok disp') < text.index('state sens') < text.index('tokens/s')
+    assert '0.9876' in text and '1.20e-03' in text and '3.40e-02' in text
+    board.update_step(5, 0, None, metrics(5))
+    assert board.latest_metrics['token_correlation'] == .9876
+    board.update_step(8, 0, None, metrics(8, token_correlation=float('nan')))
+    assert 'n/a' in board.render_text()
+
+
 def test_metrics_missing_from_a_step_keep_their_last_value(board: TrainingDashboard) -> None:
     board.update_step(1, 0, None, metrics(1, loss=4.0))
     board.update_step(2, 0, None, {"loss": 3.5})  # a non-log step: only the loss
@@ -128,6 +167,8 @@ def test_metrics_missing_from_a_step_keep_their_last_value(board: TrainingDashbo
 def test_metrics_table_uses_the_loops_own_timing_without_seconds_per_step(board: TrainingDashboard, clock: FakeClock) -> None:
     clock.advance(4)
     board.update_step(2, 0, None, metrics(2))
+    clock.advance(2)
+    board.update_step(3, 0, None, metrics(3))
     assert "2.00s" in board.render_text()
 
 
@@ -177,6 +218,7 @@ def test_rows_never_wrap_so_the_frame_height_does_not_depend_on_the_width(clock:
     with live_board(
         "run-" * 10, [long_name, "b"], STEPS, TOTAL, details=details, logger=logging.getLogger(LOGGER_NAME), console=string_console(), clock=clock
     ) as b:
+        b.update_step(2, 0, None, metrics(2))  # establish the timing baseline before testing a steady-state frame
         b.update_step(18, 0, 0.5, metrics(18))
         b.update_validation(10, {f"val_loss_{depth}": 3.0 for depth in range(1, 12)})
         b.note_event("saved checkpoint " + "outputs/very/long/path/" * 6 + "step-00000018-run.pth")
@@ -215,6 +257,7 @@ def test_a_dead_terminal_closes_the_display_and_training_continues(tmp_path: Pat
     with live_board("r", STAGES, STEPS, TOTAL, logger=logging.getLogger("training"), log_file=log_file, console=console, clock=clock) as b:
         b.update_step(1, 0, None, metrics(1))
         file.die()
+        clock.advance(0.5)
         live = _live_of(b)
         assert live is not None
         live.refresh()
@@ -237,6 +280,7 @@ def test_a_resized_terminal_gets_the_frame_redrawn_from_a_cleared_screen(clock: 
         live.refresh()
         assert "\x1b[2J" not in console_output(console), "the same size: the previous frame is erased with cursor-up"
         console.size = (100, 30)
+        clock.advance(0.5)
         live.refresh()
         live.refresh()
         assert console_output(console).count("\x1b[2J\x1b[H") == 1, "one clear per size change, right before the frame"
@@ -462,7 +506,8 @@ def test_a_frame_that_fails_outside_the_render_demotes_the_board_to_the_console_
         live = _live_of(b)
         assert live is not None
         b._console.file = _RaisingFile()
-        live.refresh()  # what the refresh thread does 4-8 times a second
+        clock.advance(10)
+        live.refresh()  # the idle heartbeat still detects a failed terminal write
         assert _is_enabled(b) is False and _live_of(b) is None and not b.headless, "the terminal itself is fine"
         b.update_step(2, 0, None, metrics(2))
     output = stream.getvalue()

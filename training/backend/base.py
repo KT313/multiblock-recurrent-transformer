@@ -8,7 +8,7 @@ The loop never touches CUDA, autocast, `torch.distributed` or rank checks direct
 a multi-rank run needs them: the checkpoint gathers every rank's RNG state (`all_gather_object`), the stop request
 is decided by `any_flag` so all ranks stop after the same step, the loss and the validation losses are reduced
 (`all_reduce`), and the main rank's packs reach the other ranks through `scatter_packs` (rank 0 owns the single
-data stream, `training.step.RankBatches`).
+data stream, `training.steps.RankBatches`).
 
 Wrappers around the model (`torch.compile`, DDP later) are applied by `setup_model` and recorded in `wrappers`;
 `plain_model` unwraps exactly that layering (`unwrap_model`) and raises on anything else, so a wrapper the backend
@@ -29,6 +29,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.optim import Optimizer
 
 from model import RecurrentGPT
+from model.execution import ExecutionPolicy
 
 T = TypeVar("T")
 
@@ -88,6 +89,11 @@ class Backend(Protocol):
     is_main: bool
     pin_memory: bool  # whether dataloaders should pin host memory (true on CUDA)
     wrappers: tuple[str, ...]  # the wrapper kinds `setup_model` applied, outermost first (`WRAPPERS`)
+
+    @property
+    def execution_policy(self) -> ExecutionPolicy:
+        """The backend's current validated precision policy."""
+        ...
 
     def setup_model(self, model: Module, compile_model: bool = False) -> Module:
         """
@@ -151,7 +157,7 @@ class Backend(Protocol):
         """
         This rank's slice of the main rank's packs: rank 0 passes a `(world_size, *slice_shape)` tensor on its
         device (the other ranks None) and every rank gets its `slice_shape` slice, on its device. The single device
-        returns `packs[0]`. One collective per micro-batch index (`training.step.RankBatches`).
+        returns `packs[0]`. One collective per micro-batch index (`training.steps.RankBatches`).
         """
 
         ...

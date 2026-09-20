@@ -38,21 +38,15 @@ from training.testing.golden import (
     single_thread_deterministic,
     write_tiny_yaml,
 )
-from training.run import build_run_optimizer
+from training.execution import build_run_optimizer
 from training.settings import OptimizerConfig, Settings, parse_settings
 from training.stage_manager import StageManager
 from training.testing.stages import resolved_stage
-from training.step import (
-    BatchStream,
-    MAX_CONSECUTIVE_REJECTS,
-    StepResult,
-    TrainingProgress,
-    model_inputs,
-    NonFiniteLossError,
-    run_one_optimizer_step,
-    scheduled_learning_rate,
-    RankBatches,
+from training.steps import (
+    BatchStream, MAX_CONSECUTIVE_REJECTS, NonFiniteLossError, RankBatches, StepResult, TrainingProgress,
+    build_model_inputs, get_scheduled_learning_rate,
 )
+from training.step import run_one_optimizer_step
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TINY_MODEL_ARCHITECTURE = REPO_ROOT / "config" / "model_architecture" / "tiny.yaml"
@@ -75,6 +69,7 @@ def reference_settings(**overrides: Any) -> Settings:
     """
 
     values: dict[str, Any] = dict(
+        use_custom_kernels=False,
         dataset_config="config/datasets/tiny.yaml",
         model_architecture_config=str(TINY_MODEL_ARCHITECTURE),
         stage_base_lrs=[3e-4],
@@ -93,7 +88,7 @@ def reference_settings(**overrides: Any) -> Settings:
         warmup_steps=2,
         cooldown_steps=2,
         log_step_interval=1,
-        log_gradient_metrics=True,
+        log_gradient_metrics_interval=1,
         wandb_enabled=False,
     )
     values.update(overrides)
@@ -139,7 +134,7 @@ def scripted_batches(settings: Settings, seed: int = 0) -> Iterator[PackedBatch]
 
 def fresh_tiny_model(backend: SingleDeviceBackend, seed: int = 0) -> torch.nn.Module:
     torch.manual_seed(seed)
-    return backend.setup_model(build_model(TINY_MODEL_ARCHITECTURE))
+    return backend.setup_model(build_model(TINY_MODEL_ARCHITECTURE, use_custom_kernels=False))
 
 
 def fresh_optimizer(settings: Settings, model: torch.nn.Module, backend: SingleDeviceBackend) -> torch.optim.Optimizer:
@@ -193,11 +188,11 @@ def test_training_progress_counts_steps() -> None:
 
 def test_scheduled_learning_rate_follows_warmup_and_cooldown(settings: Settings) -> None:
     stage_manager = reference_stage_manager(settings)  # 10 steps, warmup 2, cooldown 2, base LR 3e-4
-    lrs = [scheduled_learning_rate(settings, stage_manager, TrainingProgress(step=s)) for s in range(10)]
+    lrs = [get_scheduled_learning_rate(settings, stage_manager, TrainingProgress(step=s)) for s in range(10)]
     assert lrs[:5] == pytest.approx([0.0, 1.5e-4, 3e-4, 3e-4, 3e-4])
     assert lrs[8] == pytest.approx(3e-4) and lrs[9] == pytest.approx(1.5e-4)  # cooldown over the last 2 steps
     resumed = TrainingProgress(step=4, resume_step=4)
-    assert scheduled_learning_rate(settings, stage_manager, resumed) == pytest.approx(3e-4)  # a resume changes nothing
+    assert get_scheduled_learning_rate(settings, stage_manager, resumed) == pytest.approx(3e-4)  # a resume changes nothing
 
 
 def test_learning_rate_is_set_on_all_groups(settings: Settings, cpu_backend: SingleDeviceBackend) -> None:
@@ -263,14 +258,58 @@ def _hand_accumulation(
     copy_of_model.step = step
     torch.manual_seed(seed)
     losses = []
-    for _ in range(settings.micro_batches_per_rank(1)):
-        loss = copy_of_model(**model_inputs(next(batches), backend))["loss"]
+    for micro_batch_index in range(settings.micro_batches_per_rank(1)):
+        copy_of_model.micro_batch_index = micro_batch_index
+        loss = copy_of_model(**build_model_inputs(next(batches), backend))["loss"]
         assert loss is not None
         (loss / settings.micro_batches_per_rank(1)).backward()
         losses.append(loss.detach())
     grads = [p.grad for p in copy_of_model.parameters() if p.grad is not None]
     norm = torch.stack([g.norm() for g in grads]).norm()
     return losses, norm
+
+
+def test_on_micro_batch_reports_every_micro_batch_of_the_step(settings: Settings, cpu_backend: SingleDeviceBackend) -> None:
+    """
+    `on_micro_batch(completed, total)` is called once per micro-batch, after its backward, counting from 1 to this
+    rank's `micro_batches_per_rank`; the dashboard's micro-batch bar hangs on it. Without the callback nothing changes.
+    """
+
+    model = fresh_tiny_model(cpu_backend)
+    optimizer = fresh_optimizer(settings, model, cpu_backend)
+    stage_manager = reference_stage_manager(settings)
+    batches = scripted_batches(settings)
+    progress = TrainingProgress()
+    reports: list[tuple[int, int]] = []
+    run_one_optimizer_step(settings, cpu_backend, model, optimizer, stage_manager, batches, progress, on_micro_batch=lambda done, total: reports.append((done, total)))
+    per_rank = settings.micro_batches_per_rank(1)
+    assert reports == [(index, per_rank) for index in range(1, per_rank + 1)]
+    progress.advance()
+    run_one_optimizer_step(settings, cpu_backend, model, optimizer, stage_manager, batches, progress)
+    assert len(reports) == per_rank, "no callback, no report"
+
+
+@pytest.mark.parametrize("rank", [0, 7])
+def test_optimizer_step_sets_local_microbatch_context_on_plain_model(
+    cpu_backend: SingleDeviceBackend, monkeypatch: pytest.MonkeyPatch, rank: int,
+) -> None:
+    settings = reference_settings(
+        micro_batches_per_step=64, training_max_sequence_length=16, tokens_per_micro_batch=16,
+    )
+    cpu_backend.rank, cpu_backend.world_size = rank, 8
+    model = fresh_tiny_model(cpu_backend)
+    plain = cpu_backend.plain_model(model)
+    calls: list[tuple[int, int, int]] = []
+    original = plain.sample_block_depths
+
+    def record(block_idx: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+        calls.append((plain.step, plain.micro_batch_index, block_idx))
+        steps: tuple[torch.Tensor, torch.Tensor] = original(block_idx)
+        return steps
+
+    monkeypatch.setattr(plain, "sample_block_depths", record)
+    run_steps(settings, cpu_backend, model, fresh_optimizer(settings, model, cpu_backend), steps=2)
+    assert calls == [(step, micro, core) for step in range(2) for micro in range(8) for core in range(2)]
 
 
 def test_loss_and_grad_norm_match_a_hand_computation(cpu_backend: SingleDeviceBackend) -> None:
@@ -308,6 +347,7 @@ def test_stage_infos_and_metrics(settings: Settings, cpu_backend: SingleDeviceBa
     """
 
     settings.log_step_interval = 2
+    settings.log_gradient_metrics_interval = 2
     model = fresh_tiny_model(cpu_backend)
     optimizer = fresh_optimizer(settings, model, cpu_backend)
     stage_manager = reference_stage_manager(settings)
@@ -326,8 +366,8 @@ def test_non_finite_loss_raises_with_the_exact_message(
 
     def nan_forward(self: RecurrentGPT, *args: Any, **kwargs: Any) -> Any:
         out = forward(self, *args, **kwargs)
-        assert out["loss"] is not None
-        out["loss"] = out["loss"] * torch.tensor(float("nan"))
+        assert out["loss_sum"] is not None
+        out["loss_sum"] = out["loss_sum"] * torch.tensor(float("nan"))
         return out
 
     monkeypatch.setattr(RecurrentGPT, "forward", nan_forward)
@@ -1269,6 +1309,7 @@ def step_reference_metrics() -> dict[str, Any]:
         optimizer = fresh_optimizer(settings, model, backend)
         results = run_steps(settings, backend, model, optimizer, steps=REFERENCE_STEPS)
     return {
+        "loss_normalization": settings.loss_normalization,
         "steps": {
             str(result.step): {
                 "loss": float(result.loss),
@@ -1293,7 +1334,7 @@ def record_step_reference() -> Path:
     Recorded with torch 2.14.0+cu130 on the author's machine (CPU, fp32, one thread, deterministic algorithms), in
     the commit that made packing mandatory. The padded reference before it was recorded in the commit that extracted
     `run_one_optimizer_step`, with the tiny golden run passing unchanged, which tied the step to the thesis loop;
-    the packed loop is that step with `model_inputs` adding the per-document positions and mask.
+    the packed loop is that step with `build_model_inputs` adding the per-document positions and mask.
     """
 
     GOLDEN_STEPS_PATH.write_text(golden_run_json(step_reference_metrics()))
@@ -1542,7 +1583,7 @@ def test_model_inputs_of_a_packed_batch(cpu_backend: SingleDeviceBackend) -> Non
     """
 
     packed = next(scripted_batches(reference_settings()))
-    inputs = model_inputs(packed, cpu_backend)
+    inputs = build_model_inputs(packed, cpu_backend)
     assert set(inputs) == {"input_ids", "labels", "position_ids", "attention_mask"}
     assert torch.equal(inputs["position_ids"], packed.position_ids)
     mask = inputs["attention_mask"]
@@ -1576,7 +1617,7 @@ def test_optimizer_step_on_packed_batches(cpu_backend: SingleDeviceBackend) -> N
 
 
 def test_padding_metric_only_at_log_steps(cpu_backend: SingleDeviceBackend) -> None:
-    settings = reference_settings(log_step_interval=2, log_gradient_metrics=False)
+    settings = reference_settings(log_step_interval=2, log_gradient_metrics_interval=0)
     model = fresh_tiny_model(cpu_backend)
     optimizer = fresh_optimizer(settings, model, cpu_backend)
     first, second = run_steps(settings, cpu_backend, model, optimizer, steps=2)
@@ -1592,7 +1633,7 @@ def test_packed_step_on_cuda_runs_through_flex_attention() -> None:
 
     backend = SingleDeviceBackend(device="cuda:0", precision="bf16-mixed")
     settings = reference_settings(precision="bf16-mixed")
-    inputs = model_inputs(next(scripted_batches(settings)), backend)
+    inputs = build_model_inputs(next(scripted_batches(settings)), backend)
     assert isinstance(inputs["attention_mask"], BlockMask)
     model = fresh_tiny_model(backend)
     optimizer = fresh_optimizer(settings, model, backend)
@@ -1624,3 +1665,115 @@ def test_golden_tiny_steps() -> None:
     exact = golden_exact_requested()
     mismatches = golden_mismatches(expected, json.loads(golden_run_json(actual)), exact=exact)
     assert not mismatches, "step reference changed:\n" + "\n".join(mismatches)
+
+
+@pytest.mark.parametrize('precision,stream', [('32', 'none'), ('bf16-mixed', 'none'),
+                                            ('bf16-mixed', 'core'), ('bf16-mixed', 'all')])
+@pytest.mark.parametrize('checkpointing', ['none', 'selective', 'full'])
+def test_representation_logging_preserves_following_updates(precision: str, stream: str, checkpointing: str) -> None:
+    """Same sampled training trajectory with probes disabled/enabled, including optimizer moments and RNG."""
+    backend = SingleDeviceBackend('cpu', precision)
+    baseline = None
+    for enabled in (False, True):
+        settings = reference_settings(precision=precision, log_gradient_metrics_interval=int(enabled),
+                                      log_correlations='adapter,attention,mlp')
+        torch.manual_seed(0)
+        model = backend.setup_model(build_model(TINY_MODEL_ARCHITECTURE, use_custom_kernels=False,
+                                                gradient_checkpointing=checkpointing, bf16_residual_stream=stream))
+        optimizer = fresh_optimizer(settings, model, backend)
+        # First update is skipped; the following two exercise optimizer state and the forward after a probe.
+        try:
+            results = run_steps(settings, backend, model, optimizer, steps=3)
+        except RuntimeError as error:
+            if (not enabled and precision == 'bf16-mixed' and checkpointing == 'selective'
+                    and 'encountered during backward but not found in storage' in str(error)):
+                pytest.xfail('CPU BF16 selective checkpoint baseline fails before any diagnostic; parity untested')
+            raise
+        snapshot = {
+            'weights': copy.deepcopy(model.state_dict()), 'optimizer': copy.deepcopy(optimizer.state_dict()),
+            'rng': torch.get_rng_state().clone(),
+            'losses': [result.loss.detach().clone() for result in results],
+            'grad_norms': [result.grad_norm.detach().clone() for result in results],
+        }
+        assert all(('token_correlation' in result.metrics) == enabled for result in results)
+        if baseline is None:
+            baseline = snapshot
+        else:
+            torch.testing.assert_close(snapshot, baseline, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("log_interval,gradient_interval,start,steps", [
+    (1, 0, 0, 5), (1, 1, 0, 4), (1, 4, 0, 5), (2, 4, 0, 5), (1, 4, 2, 3), (1, 100, 0, 5),
+])
+def test_gradient_metrics_have_independent_completed_step_cadence(
+    cpu_backend: SingleDeviceBackend, monkeypatch: pytest.MonkeyPatch,
+    log_interval: int, gradient_interval: int, start: int, steps: int,
+) -> None:
+    """
+    Expensive statistics run only on their own absolute step grid, before zero_grad; basic metrics keep their grid.
+    """
+
+    settings = reference_settings(log_step_interval=log_interval, log_gradient_metrics_interval=gradient_interval,
+                                  log_correlations='attention,mlp')
+    model = fresh_tiny_model(cpu_backend)
+    optimizer = fresh_optimizer(settings, model, cpu_backend)
+    stage_manager = reference_stage_manager(settings)
+    progress = TrainingProgress(step=start, resume_step=start if start else -1)
+    batches = scripted_batches(settings)
+    calls: list[int] = []
+    recurrence_calls: list[int] = []
+
+    def record_metrics(plain: torch.nn.Module, opt: torch.optim.Optimizer) -> dict[str, torch.Tensor]:
+        assert plain is cpu_backend.plain_model(model) and opt is optimizer
+        assert any(parameter.grad is not None for parameter in plain.parameters())
+        completed = progress.step + 1
+        calls.append(completed)
+        return {"gradient_probe": torch.tensor(float(completed))}
+
+    monkeypatch.setattr("training.steps.operations.track_gradient_metrics", record_metrics)
+    def record_recurrence(plain: RecurrentGPT, backend: SingleDeviceBackend, batch: PackedBatch,
+                          *, correlations: str | None = '') -> dict[str, torch.Tensor]:
+        assert plain is cpu_backend.plain_model(model) and backend is cpu_backend
+        assert batch.input_ids.shape[0] == 1
+        assert correlations == 'attention,mlp'
+        recurrence_calls.append(progress.step+1)
+        return {"token_correlation": torch.tensor(.25)}
+    monkeypatch.setattr("training.steps.operations.track_recurrence_metrics", record_recurrence)
+    expected_calls = []
+    for _ in range(steps):
+        result = run_one_optimizer_step(settings, cpu_backend, model, optimizer, stage_manager, batches, progress)
+        progress.advance()
+        completed = progress.step
+        due = gradient_interval > 0 and completed % gradient_interval == 0
+        if due:
+            expected_calls.append(completed)
+        assert ("gradient_probe" in result.metrics) == due
+        assert ("token_correlation" in result.metrics) == due
+        assert ("packing/padding_fraction" in result.metrics) == (completed % log_interval == 0)
+        assert torch.isfinite(result.loss) and torch.isfinite(result.grad_norm)
+    assert calls == expected_calls
+    assert recurrence_calls == expected_calls
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_execution_failure_explains_explicit_native_option(
+    cpu_backend: SingleDeviceBackend, monkeypatch: pytest.MonkeyPatch, enabled: bool,
+) -> None:
+    from model.kernels.runtime import CustomKernelError
+    settings = reference_settings(use_custom_kernels=enabled, tokens_per_micro_batch=16, training_max_sequence_length=16)
+    model = fresh_tiny_model(cpu_backend)
+    failure = RuntimeError('injected launch failure')
+    calls = []
+    def fail(**kwargs: object) -> None:
+        calls.append(1)
+        raise failure
+    monkeypatch.setattr(model, 'forward', fail)
+    with pytest.raises(RuntimeError) as info:
+        run_steps(settings, cpu_backend, model, fresh_optimizer(settings, model, cpu_backend), steps=1)
+    assert calls == [1]
+    if enabled:
+        assert isinstance(info.value, CustomKernelError)
+        assert 'use_custom_kernels: false' in str(info.value)
+        assert info.value.__cause__ is failure
+    else:
+        assert info.value is failure

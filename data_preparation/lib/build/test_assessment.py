@@ -11,8 +11,8 @@ from collections.abc import Callable
 from math import ceil
 from pathlib import Path
 
-from data_preparation.dataset_config import DatasetConfig, SourceConfig
-from data_preparation.layout import DatasetLayout
+from data_preparation.lib.dataset_config import DatasetConfig, SourceConfig
+from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.build.runner import prepare, status
 from data_preparation.lib.build.planner import measured_tokens_per_row, source_ledger
 from data_preparation.lib.build.repair import repair_broken_and_stale_folders
@@ -244,7 +244,10 @@ def test_status_dry_run_and_prepare_agree_on_the_crash_leftover(
     # file is reported as the leftover a later, larger build overwrites (repair: nothing)
     _make_crash_leftover(layout.processed_dir("a"))
     served = config_file(first)  # budget of 6 tokens: one processed row serves it
-    for report in (status(served, layout.root), prepare(served, layout.root, assume_yes=False)):
+    before_publication = status(served, layout.root)
+    assert not before_publication.complete and before_publication.snapshot_problem is not None
+    assert before_publication.needs_repair == []  # the changed config needs its own snapshot, not a data repair
+    for report in (prepare(served, layout.root, assume_yes=False), status(served, layout.root)):
         assert report.complete and report.needs_repair == []
         state = next(s for s in report.sources if s.name == "a")
         assert state.satisfaction() == (True, "ok, 1 raw shard(s) past the budget unbuilt") and not state.build_pending

@@ -41,11 +41,14 @@ from torch.optim import Optimizer
 
 from evaluation.samples import GeneratedSample
 from model import RecurrentGPT
+from training.optim import dequantized_state
+from training.optim.sharding import local_optimizer
 from training.settings import Settings
 from training.stage_manager import StageInfo, StageManager
 from training.ui.board import TrainingDashboard
+from training.ui.throughput import Throughput
 from training.ui.capture import WANDB_QUIET_SETTINGS
-from training.ui.common import KEEP, TRAIN_LOG_NAME, TRAIN_REPORT_NAME, dashboard_enabled
+from training.ui.common import KEEP, TRAIN_LOG_NAME, TRAIN_REPORT_NAME, dashboard_enabled, micro_batches_shown
 from training.ui.fallback import ConsoleFallbackDashboard
 
 if TYPE_CHECKING:
@@ -53,7 +56,7 @@ if TYPE_CHECKING:
 
     from training.backend.base import Backend
     from training.data.dataset_resolver import ResolvedDataset
-    from training.step import StepResult, TrainingProgress  # `step.py` imports `track_gradient_metrics` from here
+    from training.steps import StepResult, TrainingProgress
 
 CONSOLE_LOGGER_NAME = "training.logger"  # under the `training` hierarchy; named explicitly, not via `__name__`
 SILENT_CONSOLE_LOGGER_NAME = f"{CONSOLE_LOGGER_NAME}.silent"  # the non-main ranks' console: nothing leaves it
@@ -253,7 +256,7 @@ class TrainingReport:
 
 class Dashboard(Protocol):
     """
-    The five calls `RunLogger` makes on the run's terminal dashboard. `training.ui`'s `TrainingDashboard` (the
+    The six calls `RunLogger` makes on the run's terminal dashboard. `training.ui`'s `TrainingDashboard` (the
     live display) and `ConsoleFallbackDashboard` satisfy it; tests pass a recording fake.
     """
 
@@ -268,6 +271,8 @@ class Dashboard(Protocol):
     def set_status(self, text: str) -> None: ...
 
     def discount_time(self, seconds: float) -> None: ...
+
+    def update_micro_batch(self, completed: int, total: int) -> None: ...
 
 
 class NullDashboard:
@@ -290,6 +295,9 @@ class NullDashboard:
         return None
 
     def discount_time(self, seconds: float) -> None:
+        return None
+
+    def update_micro_batch(self, completed: int, total: int) -> None:
         return None
 
 
@@ -324,6 +332,7 @@ def open_dashboard(
             start_step=start_step,
             log_step_interval=settings.log_step_interval,
             fallback_stream=sys.stderr,
+            show_micro_batches=micro_batches_shown(),
         )
     else:
         board = ConsoleFallbackDashboard(
@@ -399,6 +408,7 @@ class RunLogger:
         # `setup_started` is the CLI's wall-clock reading (`train.py`), from before this object and its clock existed
         self.setup_seconds = wall_clock() - setup_started if setup_started is not None else 0.0
         self._train_started = now  # the train timer: `total_time` of the metrics, `train_time` of the wandb summary
+        self._eta = Throughput(stage_manager.total_steps, start_step=start_step, clock=clock)
         self._interval_started = now  # the log-interval timer behind `seconds/step`; reset at every log step
         self._interval_step = start_step  # the step the interval timer started at
         self._side_seconds = 0.0  # seconds spent outside the training loop since the last log step (`_timed_status`)
@@ -545,7 +555,17 @@ class RunLogger:
             finally:
                 seconds = self._clock() - started
                 self._side_seconds += seconds
+                self._eta.discount(seconds)
                 self.dashboard.discount_time(seconds)
+
+    def note_micro_batch(self, completed: int, total: int) -> None:
+        """
+        `completed` of the `total` micro-batches of the running optimizer step are done on this rank; the loop calls
+        it after every micro-batch (`run_one_optimizer_step`'s `on_micro_batch`). Only the live dashboard with
+        `DASHBOARD_SHOW_MICRO_BATCHES` shows it; no record, no metric.
+        """
+
+        self.dashboard.update_micro_batch(completed, total)
 
     @contextmanager
     def evaluating(self) -> Iterator[None]:
@@ -669,6 +689,8 @@ class RunLogger:
         * `seconds/step`, `tokens/second`, `remaining_time`: training only, the timed blocks that are not steps
           (evaluation, checkpoints, samples, benchmarks) subtracted; `total_tokens` (from step 0, also after a
           resume) and `total_time` (wall time since `open`, everything included);
+          `remaining_time` uses the dashboard's EMA policy and is omitted during startup warmup. Raw interval
+          rates still report the actual interval duration, including startup work;
         * `stage/current_stage`, `stage/base_lr`, `stage/in_transition`, `stage/transition_progress`,
           `stage/stage_progress`: the stage info the step trained on (`result.stage`);
         * `data_composition/<data id>`: the fraction of the trained document tokens per data id since the last log
@@ -677,10 +699,11 @@ class RunLogger:
         * `data/wait_seconds`, `data/wait_fraction`: the seconds the loaders blocked on a worker batch since the last
           log step and their share of the interval's training time; above `DATA_WAIT_WARNING_FRACTION` a kept
           warning names the slowest sources, repeated at most every `DATA_WAIT_WARNING_INTERVAL_SECONDS`;
-        * `track_gradient_metrics` (`result.metrics`) and the validation metrics (`val_loss*`, `val_ppl*`,
+        * extra gradient and representation/state probe metrics on `log_gradient_metrics_interval` steps (0: disabled), and the validation metrics (`val_loss*`, `val_ppl*`,
           `val_loss/<data id>` per validation source, `val_time`).
         """
 
+        self._eta.record(progress.step)  # every completed step, independently of the log interval
         for data_id, tokens in result.data_tokens.items():
             self._token_counter[data_id] = self._token_counter.get(data_id, 0) + tokens
         for source, seconds in (data_wait or {}).items():
@@ -763,13 +786,15 @@ class RunLogger:
             "tokens/second": self.tokens_per_step / seconds_per_step if seconds_per_step > 0 else 0.0,
             "total_tokens": progress.step * self.tokens_per_step,
             "total_time": now - self._train_started,
-            "remaining_time": seconds_per_step * (self.stage_manager.total_steps - progress.step),
             "stage/current_stage": result.stage.stage_index,
             "stage/base_lr": self.stage_manager.stages[result.stage.stage_index].base_lr,
             "stage/in_transition": int(result.stage.transition_to is not None),
             "stage/transition_progress": result.stage.transition_progress,
             "stage/stage_progress": result.stage.stage_progress,
         }
+        remaining = self._eta.remaining(progress.step)
+        if remaining is not None:
+            metrics["remaining_time"] = remaining
         metrics |= {f"data_composition/{name}": count / total_tokens for name, count in self._token_counter.items()}
         self._token_counter.clear()
         metrics |= self._data_wait_metrics(now, training_seconds, steps_in_interval)
@@ -794,8 +819,8 @@ class RunLogger:
             )
             self.console.warning(
                 "the run waited %.1fs for training data over the last %d step(s), %.0f%% of the training time "
-                "(slowest: %s): the loader workers do not keep up with the model (worker start-ups are not counted), "
-                "tokenization is the bottleneck",
+                "(slowest: %s): loader waiting (worker start-ups are not counted); possible causes include storage, "
+                "decompression, tokenization, collation, worker scheduling and inter-process transfer",
                 wait_seconds,
                 steps,
                 100 * fraction,
@@ -858,8 +883,8 @@ def _reverse_engineer_adam_effective_lr(
 
     grad = param.grad
     assert grad is not None, "effective LR needs a gradient"
-    exp_avg = param_state["exp_avg"].float()
-    denom = param_state["exp_avg_sq"].float().sqrt().add_(group["eps"])
+    exp_avg = dequantized_state(param_state["exp_avg"]).float()
+    denom = dequantized_state(param_state["exp_avg_sq"]).float().sqrt().add_(group["eps"])
     return torch.where(
         grad.float().abs() > group["eps"],
         exp_avg / denom / grad.float(),
@@ -879,7 +904,9 @@ def _qkv_dims(model: Module) -> Optional[tuple[int, int, int]]:
 
 
 @torch.no_grad()
-def track_gradient_metrics(model: Module, optimizer: Optimizer) -> dict[str, torch.Tensor]:
+def track_gradient_metrics(
+    model: Module, optimizer: Optimizer, *, backend: Backend | None = None
+) -> dict[str, torch.Tensor]:
     """
     Gradient norms, Adam second-moment RMS, effective LRs and parameter norms. Call after `optimizer.step()`
     and before `zero_grad()`.
@@ -895,6 +922,17 @@ def track_gradient_metrics(model: Module, optimizer: Optimizer) -> dict[str, tor
     wte_module: Optional[Module] = getattr(transformer, "wte", None)
     wte_weight: Optional[torch.Tensor] = getattr(wte_module, "weight", None)
     names = {id(param): name for name, param in model.named_parameters()}
+    owner = local_optimizer(optimizer)
+    initialized: set[str] = set()
+    if owner is not optimizer:
+        if backend is None:
+            raise ValueError("sharded optimizer metrics require the distributed backend on every rank")
+        local_names = {
+            names[id(param)] for param, values in owner.state.items()
+            if param.grad is not None and values.get("exp_avg_sq") is not None
+            and values["exp_avg_sq"].shape == param.grad.shape
+        }
+        initialized = set().union(*backend.all_gather_object(local_names))
 
     grad_qkv_layer, grad_mlp_layer = 0, 0  # `query_grad_<i>` / `ffn2_grad_<i>`
     lr_qkv_layer, lr_mlp_layer = 0, 0  # `*_effective_lr_<i>`
@@ -924,14 +962,18 @@ def track_gradient_metrics(model: Module, optimizer: Optimizer) -> dict[str, tor
         if not finite:
             continue
         finite_grads.append(grad)
-        state = optimizer.state.get(param)
+        state = owner.state.get(param)
         if state is None:
+            # Reserve the same historical index on ranks that do not own this parameter's moments.
+            if name in initialized:
+                lr_qkv_layer += int(is_qkv)
+                lr_mlp_layer += int(is_proj)
             continue
         exp_avg_sq = state.get("exp_avg_sq")
         if exp_avg_sq is None or exp_avg_sq.shape != grad.shape:
             continue
         # out of place: `.float()` aliases an fp32 buffer, an in-place clamp would edit the optimizer state
-        rms = grad.float().pow(2).div_(exp_avg_sq.float().clamp(min=group["eps"] ** 2)).mean().sqrt()
+        rms = grad.float().pow(2).div_(dequantized_state(exp_avg_sq).float().clamp(min=group["eps"] ** 2)).mean().sqrt()
         total_rms += rms
         num_params_with_grad += 1
         if wte_weight is not None and param is wte_weight:
@@ -974,4 +1016,33 @@ def track_gradient_metrics(model: Module, optimizer: Optimizer) -> dict[str, tor
         metrics["model_l2_param_norm"] = torch.norm(
             torch.stack([torch.norm(param.detach()) for name, param in model.named_parameters() if "wte" not in name])
         )
+    if owner is not optimizer:
+        assert backend is not None
+        metrics = _merge_sharded_gradient_metrics(metrics, num_params_with_grad, backend)
+    return metrics
+
+
+def _merge_sharded_gradient_metrics(
+    metrics: dict[str, torch.Tensor], rms_count: int, backend: Backend
+) -> dict[str, torch.Tensor]:
+    """Gather only owner-derived scalars; replicated gradient/parameter norms need no reduction."""
+    selected = {key: value for key, value in metrics.items()
+                if "effective_lr" in key or key in ("embed_RMS", "avg_RMS")}
+    # One batched device-to-host transfer, not one synchronization per tensor.
+    values = torch.stack([value.to(backend.device) for value in selected.values()]).cpu().tolist() if selected else []
+    records = backend.all_gather_object((dict(zip(selected, values, strict=True)), rms_count))
+    total, count = 0.0, 0
+    seen: set[str] = set()
+    for scalars, number in records:
+        total += scalars.get("avg_RMS", 0.0) * number
+        count += number
+        for key, value in scalars.items():
+            if key == "avg_RMS":
+                continue
+            if key in seen:
+                raise RuntimeError(f"optimizer metric {key} has multiple owners")
+            seen.add(key)
+            metrics[key] = torch.tensor(value)
+    if count:
+        metrics["avg_RMS"] = torch.tensor(total / count)
     return metrics

@@ -114,16 +114,20 @@ class ParquetTextDataset(IterableDataset[Row]):
         worker_id = worker.id if worker is not None else 0
         return self.rank * num_workers + worker_id, self.world_size * num_workers
 
-    def _range_batches(self, keys: list[str]) -> Iterator[tuple[int, pa.RecordBatch]]:
+    def _range_batches(self, keys: list[str], offset: int) -> Iterator[tuple[int, pa.RecordBatch]]:
         """
-        (range_idx, batch) pairs covering exactly rows [start, stop); range_idx is the position of
-        the batch's first row within the range. Files and row groups outside the range are never opened/read.
+        (range_idx, batch) pairs covering [start + offset, stop); range_idx stays relative to the original
+        start, so resuming does not reset modulo shard assignments. Footer counts skip preceding files before
+        opening them and preceding row groups before decoding them. The caller snapshots the epoch's offset.
         """
 
+        read_start = self.start + offset
+        if read_start >= self.stop:
+            return
         file_start = 0
         for file, rows_in_file in zip(self.files, self.file_rows):
             file_stop = file_start + rows_in_file
-            if file_stop <= self.start or rows_in_file == 0:  # before the range (or empty): skipped via the footer
+            if file_stop <= read_start or rows_in_file == 0:  # before the range (or empty): skipped via the footer
                 file_start = file_stop
                 continue
             if file_start >= self.stop:
@@ -134,7 +138,7 @@ class ParquetTextDataset(IterableDataset[Row]):
             first_group_start = file_start
             for group in range(parquet.num_row_groups):
                 group_stop = group_start + parquet.metadata.row_group(group).num_rows
-                if group_stop > self.start and group_start < self.stop:
+                if group_stop > group_start and group_stop > read_start and group_start < self.stop:
                     if not row_groups:
                         first_group_start = group_start
                     row_groups.append(group)
@@ -142,7 +146,7 @@ class ParquetTextDataset(IterableDataset[Row]):
             batch_start = first_group_start  # directory index of the batch's first row
             for batch in parquet.iter_batches(batch_size=PARQUET_READ_BATCH_ROWS, columns=keys, row_groups=row_groups):
                 batch_stop = batch_start + batch.num_rows
-                clip_start, clip_stop = max(batch_start, self.start), min(batch_stop, self.stop)
+                clip_start, clip_stop = max(batch_start, read_start), min(batch_stop, self.stop)
                 if clip_start < clip_stop:
                     yield clip_start - self.start, batch.slice(clip_start - batch_start, clip_stop - clip_start)
                 batch_start = batch_stop
@@ -158,16 +162,19 @@ class ParquetTextDataset(IterableDataset[Row]):
             f"{self.prefix}: shard {shard_id}/{num_shards} over rows [{self.start + offset}, {self.stop}) "
             f"({self.num_rows - offset} of {self.num_rows} rows) in {self.data_dir}"
         )
-        for range_idx, batch in self._range_batches(keys):
-            if range_idx + batch.num_rows <= offset:  # entirely before the resume offset: never decoded
+        for range_idx, batch in self._range_batches(keys, offset):
+            # Select in Arrow before building Python strings/dicts: validation ranks and loader workers need
+            # only their assigned rows. The stride uses the original range index, including on resumed epochs.
+            first = (shard_id - range_idx) % num_shards
+            if first >= batch.num_rows:
                 continue
+            if num_shards > 1:
+                batch = batch.take(pa.array(range(first, batch.num_rows, num_shards), type=pa.int64()))
             record: Row
             for record in batch.to_pylist():
-                if range_idx >= offset and range_idx % num_shards == shard_id:
-                    record["data_signature"] = self.data_signature
-                    record["data_id"] = self.prefix
-                    yield record
-                range_idx += 1
+                record["data_signature"] = self.data_signature
+                record["data_id"] = self.prefix
+                yield record
 
 
 class WeightedMixtureDataset(IterableDataset[T], Generic[T]):

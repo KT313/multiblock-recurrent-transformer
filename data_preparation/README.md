@@ -7,13 +7,18 @@ sources). `uv run python data_preparation/prepare.py prepare --dataset_config <f
 the prepared data before training, building whatever is missing by default. The pipeline does two things per
 source, **download** rows and **build** a cleaned copy, and nothing else: mixing sources by weight and splitting
 a source into training and validation rows happen in the training dataloader. Everything runs from the repo root
-with `uv run ...`; the implementation lives in `lib/` (tests beside every module).
+with `uv run ...`; CLI support lives in `cli/` and the implementation lives in `lib/` (tests beside every module).
+
+Other packages should import the public config types, `DatasetLayout`, and `load_dataset_config` from
+`data_preparation`, for example `from data_preparation import DatasetConfig, DatasetLayout, load_dataset_config`.
+These exports are loaded on demand and remain stable when implementation files move. Modules inside
+`data_preparation` use direct internal imports to avoid circular dependencies.
 
 ## The dataset config
 
-**Config reference:** `data_preparation/dataset_config.py` itself: the `DatasetConfig` docstring lists the
+**Config reference:** `data_preparation/lib/dataset_config.py` itself: the `DatasetConfig` docstring lists the
 top-level keys, every field carries a `# ...` comment, `__post_init__` holds the validation rules;
-`data_preparation/layout.py` beside it maps a config to its directories under `dataset/`. Nothing here duplicates
+`data_preparation/lib/layout.py` beside it maps a config to its directories under `dataset/`. Nothing here duplicates
 that file; this is the shape:
 
 ```yaml
@@ -51,25 +56,32 @@ Two source kinds: `pretrain` (one text column, `text_field`) and `instruct` (`in
 row shape, the filters that apply and how training formats a row. Stage keys are source names, in `train` and in
 `val` alike; how a source is used decides its split at training time (below). Loading fails on unknown keys,
 weights that are zero or do not sum to 1, a source used by no stage, a source used only in `val` without `rows`, a
-training source with `rows`, and so on. The keys of the earlier schema (`instruct_mixtures`, `validation_tokens`,
-`max_chars`, `max_tokens`, `tokens_per_row_estimate`, `<source>/validation` stage keys) are simply unknown now:
-mixing and the validation split are the training dataloader's job, rows are truncated to `dataset_max_sequence_length` tokens at
-download, and the planner counts tokens (`describe_tokens_per_row` is its starting rate, not a description).
+training source with `rows`, and so on. Mixing and the validation split belong to the training dataloader.
+Rows are capped at `dataset_max_sequence_length` at download, and `describe_tokens_per_row` supplies the
+planner's initial token-count estimate.
 
-The configs in the tree: `config/datasets/crow_300m_final.yaml` (the thesis run; `docs/data_mixture.md` is
-generated from it), `config/datasets/crow_300m_mini.yaml` (the same sources with tiny budgets: a real-source smoke
-build of a few MB that exercises every loader; needs `HF_TOKEN` for `mini-peS2o`) and `config/datasets/tiny.yaml`
-(synthetic, builds in seconds, used by the tests and `config/tiny.yaml`).
+Source keys and `tokenizer.name` are filesystem identities and must be nonempty single path components.
+Absolute paths, drive-qualified names, `/`, `\`, NULs, `.` and `..` are rejected. `.build-work` and the
+legacy `.tmp`/`.old` suffixes are reserved, so `books` and `books.old` cannot coexist as declared sources.
+Valid names retain their exact spelling and case; repository IDs, input paths and stage labels have separate
+rules. Generated GitHub-code source names are checked before their directories are published.
 
-## On-disk layout: two trees
+Example configs include `config/datasets/final_100B_tokens.yaml` (100B-token curriculum),
+`config/datasets/crow_300m_final.yaml` (300M-model curriculum), `config/datasets/crow_300m_mini.yaml`
+(the Crow sources with small budgets; needs `HF_TOKEN` for `mini-peS2o`), and `config/datasets/tiny.yaml`
+(synthetic, used by tests and `config/tiny.yaml`).
+
+## On-disk layout
 
 ```
 dataset/
 ├── sources/<source>/raw/     MANIFEST.json + data-*.parquet   rows as downloaded (converter applied, pretrain text
 │                                                              truncated to dataset_max_sequence_length tokens, `tokens` column);
 │                                                              append-only; the ONLY tree the download step writes
-├── processed/<source>/       MANIFEST.json + data-*.parquet   rows after cleaning; derived from raw, cheap to rebuild;
-│                                                              the ONLY tree the build step writes  <- training reads this
+├── processed/<source>/       MANIFEST.json + data-*.parquet   reusable source-local candidates (training output when global dedup is false);
+├── .dataset-scopes/<config hash>/processed/<source>/       globally filtered final rows; default training paths
+├── snapshots/<config hash>.json                            completed dataset build descriptor
+├── .build-work/processed/<source>/{temporary,backup}/       private, owned build generations
 ├── tokenizers/<name>/        MANIFEST.json + tokenizer files
 ├── hub_index/<repo>@<rev>/   file lists, row counts and row-group layout of `hf_files` / `github_code` repos (safe to delete)
 ├── benchmarks/               cached benchmark test sets (decontamination only)
@@ -77,8 +89,19 @@ dataset/
 └── .build.lock               one build per directory
 ```
 
-Both trees are shared by every dataset config (stages 1 and 2 of the thesis config draw from the same
-`processed/fineweb_edu`, only with different weights). Every folder carries a `MANIFEST.json`
+All-at-once processed builds publish from the private work tree. `BUILD_OWNER.json` records the source,
+canonical final path, role and build UUID separately from content manifests, so temporary names do not change
+content hashes. Recovery verifies ownership before removing a partial build, adopting a completed build, or
+removing its replaced backup. A dataset-root symlink is allowed; child/artifact symlinks are rejected.
+
+Legacy `processed/<source>.tmp` and `.old` folders are recovered only when a parseable processed manifest
+identifies the expected source (or valid explicit ownership metadata is present). Anonymous, wrong-source or
+conflicting leftovers are preserved and preparation fails with their path; inspect those folders manually.
+Status/dry-run only inspects ownership and never creates, deletes or adopts artifacts.
+
+Raw and source-local candidate trees are shared by dataset configs. Global final output belongs to one
+config scope; stages of that config share each source's final rows with their configured weights.
+Every source folder carries a `MANIFEST.json`
 (`lib/storage/manifest.py`): the hash of the settings that produced it and the exact dict it was computed from
 (`hash_payload`), rows and tokens per shard, the loader offset and the rejected-row totals after each raw shard, how
 tokens were counted (`token_count`, `tokenizer`, and for raw the tokenizer's definition hash `tokenizer_hash`) and,
@@ -119,14 +142,14 @@ Shards are published **one at a time** (written to a `.tmp` file, renamed, recor
 with the loader offset **and** the rejected-row totals as of their last row), so a network error, a crash or Ctrl-C
 keeps everything fetched so far and the next run resumes behind the last complete shard without counting a skipped
 or dropped source row twice. All-at-once builds (shuffled sources, minhash) write into
-`processed/<source>.tmp` and rename it into place.
+`.build-work/processed/<source>/temporary` and rename it into place.
 
 ## Commands
 
 ```bash
 uv run python data_preparation/prepare.py prepare  --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
         [--sources NAME ...] [--steps tokenizer download build] [--reopen NAME ...] [--yes] [--dry_run]
-        [--num_workers N] [--pass_workers N] [--max_parallel_downloads N] [--hf_token T] [--cache_dir DIR]
+        [--num_workers N] [--pass_workers N] [--global_hash_workers N] [--max_parallel_downloads N] [--download_prefetch_mb N] [--hf_token T] [--cache_dir DIR]
 uv run python data_preparation/prepare.py download --dataset_config config/datasets/<name>.yaml [same options; --steps tokenizer download]
 uv run python data_preparation/prepare.py status   --dataset_config config/datasets/<name>.yaml [--dataset_dir dataset]
 uv run python data_preparation/prepare.py describe --dataset_config config/datasets/<name>.yaml > docs/data_mixture.md
@@ -142,11 +165,15 @@ uv run python data_preparation/prepare.py tiny     # = prepare --dataset_config 
   (`make prepare`) builds them from the raw shards without downloading again.
   Exit codes: 0 ok, 1 a failed source (logged with its traceback; the other jobs stop at their next shard: a
   failed source is a failed build, never a silently smaller dataset), 2 an unconfirmed raw deletion (below), 3
-  another data preparation still running, 130 Ctrl-C (every running step stops at its next shard, everything
-  published is kept; rerun to resume). One run at a time (`dataset/.build.lock`, `lib/build/lock.py`; training holds
-  `<out_dir>/.train.lock` the same way): a second `prepare` or a `train.py` auto-prepare on the same directory exits 3
-  right away, naming the running one's start time and pid and how to stop it (`kill -INT <pid>`); the lock is the
-  OS's, released when the holder ends, so it never goes stale.
+  a conflicting dataset lock, 130 Ctrl-C (every running step stops at its next shard, everything
+  published is kept; rerun to resume). Preparation and training with `auto_prepare: true` require exclusive
+  ownership of `dataset/.build.lock`. Training with `auto_prepare: false` uses a shared lock, allowing concurrent
+  read-only runs. Training first holds `<out_dir>/.train.lock`, preventing concurrent runs in one output directory.
+  Locks coordinate across configs and relative, absolute or symlink aliases of the same canonical dataset root.
+  A conflict exits promptly with the lock path. Rank zero owns the lock continuously through assessment,
+  auto-prepare, training, validation, final work and every rank's reader cleanup. Auto-prepare borrows a validated process-local lease without unlocking.
+  Never delete the lock file to recover: its inode must stay stable. The OS releases ownership when all owning
+  descriptors close (forked children may retain descriptors after the parent dies). Different roots are independent.
 - `status` is read-only: what the repair step *would* do plus the status table (rows needed / tokens per row / raw /
   processed / epochs / state / reason per source and the tokenizer); exit 0 iff the dataset is complete. A source the
   repair step would touch counts as incomplete.
@@ -155,35 +182,32 @@ uv run python data_preparation/prepare.py tiny     # = prepare --dataset_config 
   source and the source registry. The comment block at the top of the YAML becomes its "Notes" section. `docs/data_mixture.md` is that
   output for the crow config; regenerate it after editing the config.
 
+`lib/build/lock.py:dataset_lock(root, program, lease=...)` is the ownership API; `build_lock` remains a compatibility
+entry point using the same `.build.lock`. `prepare(..., dataset_lease=lease)` accepts only a live lease for the
+same canonical root and process. Internal mutation helpers require their caller to hold ownership through worker
+shutdown. A standalone `resolve_dataset` borrows/acquires while resolving metadata and releases on return; code
+that subsequently starts readers must retain an outer `dataset_access` context through reader cleanup.
+
+`status` and `--dry_run` remain read-only, unlocked observations, which may change during another operation.
+Advisory locks protect cooperating current entry points, not arbitrary external writers or older training binaries.
+Distributed acquisition/setup errors are exchanged before peers continue. Normal reader cleanup has a completion
+boundary before rank zero unlocks; fatal peer loss instead requires the distributed launcher's teardown. A local
+`flock` is not a crash-proof distributed lease if rank zero dies while peers are still alive. Network filesystems
+must provide working cross-process/cross-host `flock` semantics; no timeout-based lock stealing is implemented.
+
 ## What `prepare` does
 
-`lib/build/runner.py:prepare` is the whole pipeline, readable top to bottom; trimmed to its shape:
+Preparation holds the dataset lock while assessing repairs, preparing the tokenizer, reopening requested
+sources, and running download/build rounds. Completed sources are reused. With dataset-wide deduplication,
+candidates are admitted in priority order and sources are topped up as needed before publishing a coherent
+snapshot. Preparation finishes with a status report. See `lib/build/runner.py` for the entry point.
 
-```python
-def prepare(config_path, dataset_dir, *, num_workers, pass_workers, max_parallel_downloads, assume_yes, dry_run, steps, sources, ...):
-    config = load_dataset_config(config_path)
-    layout = DatasetLayout(Path(dataset_dir))
-    with build_lock(layout.root):
-        prepare_tokenizer(config, layout)                                    # tokenizers/<name>/ (downloads count with it)
-        repair_report = repair_broken_and_stale_folders(config, layout, assume_yes=assume_yes, dry_run=dry_run, confirm=confirm)
-        reopen_sources(config, layout, reopened, dry_run=dry_run)            # --reopen: clear the exhausted latch
-        for round_number in range(1, MAX_ROUNDS + 1):                        # MAX_ROUNDS = 5
-            download_plan = plan_downloads(config, layout, sources=selected)  # rows still missing per source
-            download_and_build_missing(download_plan, config, layout, ...)   # downloads (sources/<s>/raw) and builds (processed/<s>)
-                                                                             # side by side; a source is built as soon as its download finished
-            if every_source_satisfies_its_budget(config, layout, sources=selected):
-                break
-            if not another_round_can_fetch_more(config, layout, active_steps, selected):
-                break                                                        # still short, nothing left to download: reported
-        report = summarize_dataset_state(config, layout)                     # the status table
-    return report
-```
-
-`download_and_build_missing` is the only place with thread-pool code: a pool of `--max_parallel_downloads` download
+`download_and_build_missing` owns the source-job pools: a pool of `--max_parallel_downloads` download
 jobs (the `github_code` sources of one repo form one job, every member of the repo included, and are read in a single
 pass over the repo's files) and a pool of `--num_workers` build jobs (threads) run side by side under one stop flag; each build additionally holds a
-spawn process pool of `--pass_workers` for its optional cleaning passes (decontamination / minhash, off in the
-shipped configs), so those toggles cost up to `num_workers × pass_workers` worker processes (2 × 4 = 8 with the
+spawn process pool of `--pass_workers`: the shard workers of a per-raw-shard pretrain build (below), or the
+optional cleaning passes (decontamination / minhash, off in the shipped configs), so a run costs up to
+`num_workers × pass_workers` worker processes (2 × 4 = 8 with the
 defaults). Sources with nothing to download are built right away, every other source the
 moment its download job finished (the members of a `github_code` group after the group pass), so a source is never
 built while its own download runs; a failure or Ctrl-C stops both pools at their next shard, and a second Ctrl-C
@@ -194,8 +218,26 @@ not the larger of the two. Inside a download job, fetching the next row group an
 overlap too (a token worker thread per job; the rows are still written in order), and `prepare.py` turns the
 tokenizer's own thread pool on (`TOKENIZERS_PARALLELISM=true`, off by library default because a training run that
 prepares data in-process forks DataLoader workers afterwards) with 8 threads (`RAYON_NUM_THREADS`; the pool is one
-per process and shared by every download job, and past 8 threads a batch barely gets faster). A single download is
-therefore bound by its network fetch; `--max_parallel_downloads` scales from there.
+per process and shared by every download job). `--tokenizer_threads N` above 8 runs ceil(N/8) separate tokenizer processes with
+balanced thread counts (`lib/stages/tokenizer_pool.py`; 20 threads are 7 + 7 + 6) that every job's token worker
+feeds, keeping one batch per process in flight and storing in submission order. Tune concurrency with
+representative input: a download can be limited by network, decoding, tokenization, or writing.
+`--max_parallel_downloads` overlaps work across sources.
+
+For server downloads, `--download_prefetch_mb 16` fetches the next 16 MiB of the current remote file in a
+background thread while its previous bytes are decoded and processed. This applies to `hf_files` and grouped
+`github_code` remote reads, including Parquet and compressed JSON streams; cached/local files and the
+`hf_split`/`hf_stream` loaders are unchanged. Set `download_prefetch_mb: 16` in the dataset YAML to persist it;
+the CLI overrides that value, including `--download_prefetch_mb 0` to disable it. The default is 0 (off).
+
+Each active remote file retains at most two blocks: the current block and one pending block. With eight
+download jobs and 16 MiB blocks this adds up to 256 MiB of byte buffers, beyond normal decoder, HTTP,
+tokenizer, and writer memory. This changes only IO scheduling: source/row order, row-group alignment, saved
+offsets, token counts, and dataset hashes are unchanged. Some prefetched bytes may be unused after a seek,
+stop, or target completion; larger values can waste bandwidth on sparsely read Parquet columns. Workers are
+joined and remote handles closed on completion, stop, or failure; shutdown may wait for an in-flight HTTP
+request. Network failures propagate rather than silently disabling prefetch. No whole-file or next-file
+downloads are introduced by this setting.
 
 A round is normally enough. A second one happens when the raw shards of the first measured fewer tokens per row than
 the estimate the download was sized with (by more than the 20 % safety margin covers), or when the length filter and
@@ -249,8 +291,8 @@ than a gap. For that the shared file index counts *every* language of every full
 (`full_counts` in `dataset/hub_index/`), and a stop or a failure publishes each folder's buffered rows as a short
 final shard first, so every folder's offset is the frontier the pass reached and the next pass resumes them all
 aligned. The cost is disk (the whole decoded volume, zstd, instead of the wanted languages), the tokenizer running
-over every row (the 8-thread pool keeps up with a row group's fetch), and one shard buffer per language (passive
-shards are a quarter of `shard_size`). `build.log` lists the rows stored past each target and per extra language.
+over every row (on a fast link this is the bottleneck: `--tokenizer_threads`), and one shard buffer per language
+(passive shards are a quarter of `shard_size`). `build.log` lists the rows stored past each target and per extra language.
 
 ### Build (`lib/stages/build.py`)
 
@@ -268,14 +310,47 @@ trainer's text (`instruct_text`). Every processed row carries `tokens` (the raw 
   (`lib/build/planner.py`; `build_source(rows_target=)`), so raw rows past the budget (a `github_code` member fed
   on after its target, above) cost raw disk only. A processed folder behind raw that serves the budget is healthy,
   satisfied (`ok, N raw shard(s) past the budget unbuilt` in the status table) and not a pending build; a larger
-  budget, or a lower measured tokens-per-row rate, builds the next shards.
-- **all at once** (`shuffle: true`, the default for instruct sources, and minhash mode): every raw shard is read,
-  the survivors are shuffled with `random.Random(seed)`, written into `processed/<source>.tmp` and renamed into
-  place; a top-up rebuilds the folder whole. Why shuffle at all: the training loader reads a source's shards **in
+  budget, or a lower measured tokens-per-row rate, builds the next shards. **Shard workers**: with `--pass_workers`
+  above 1 (and decontamination off) the raw shards are read, length- and quality-filtered, hashed and written as
+  private staged shards in that many spawn processes (`lib/stages/build_workers.py`, raw shard k on worker
+  k % pass_workers, one shard per worker ahead of the loop); only the hashes and file metadata come back. The
+  parent publishes the staged files with atomic renames under the dataset lock; the Bloom dedup, statistics,
+  manifest and stop check also stay in the build thread, so the rows, shard boundaries and resume
+  points match the in-thread path. Shard processes allow CPU work to run beyond the build threads' shared GIL.
+  Each invocation has a unique directory under
+  `.build-work/processed/<source>/shard-workers/`, cleaned after its workers join. Forced parent exit can leave
+  private files there, but surviving workers cannot publish into a replacement run; abandoned directories are
+  never reused or automatically removed while old workers might still write. Staging and processed output must
+  be on the same filesystem for atomic promotion. A source already serving its row budget starts no shard
+  workers; an active build stops queuing replacement read-ahead when its current shard will satisfy the budget.
+- **whole-source publication** (`shuffle: true`, the default for instruct sources, and minhash mode): every raw
+  shard is streamed through the existing processing pipeline, with results written into
+  `.build-work/processed/<source>/temporary` and renamed into place only when complete; a top-up rebuilds the
+  folder whole. Why shuffle at all: the training loader reads a source's shards **in
   order** and only mixes *between* sources; instruct repositories are sorted by task, so without a shuffle the model
   would see one task for thousands of steps and the "first k rows" validation split (below) would be a single task.
-  Instruct sources are small (the eight of the thesis run hold about 150 M tokens together), so rebuilding them
-  whole is cheap. Pretrain sources are not shuffled (`shuffle: false` unless set).
+  Pretrain sources are not shuffled (`shuffle: false` unless set).
+
+**Disk-backed shuffle** (`lib/stages/shuffle.py`): each surviving row receives a seeded random 128-bit key.
+Rows are staged in a disposable SQLite database inside the owned build workspace, then streamed in key order
+into normal Parquet shards. The original row ordinal breaks key ties; duplicates are never lost by the shuffle.
+This mixes across the entire source, independently of input/output batch boundaries. Filters, inversions and
+source-local dedup still run before shuffling in their original order. SQLite has a 32 MiB page-cache target per
+active source with memory mapping disabled; processing and output batches, the existing Bloom filter, and any
+workers are additional memory. No whole-source row list or permutation is kept in RAM.
+**MinHash retains rows and its LSH index and has a 250,000-row limit.**
+
+The tradeoff is additional disk I/O and temporary disk usage: allow space for the uncompressed JSON row payloads,
+SQLite pages/index overhead, and replacement Parquet shards alongside any previous processed generation. SQLite
+errors (including disk full) stop the build with workspace guidance; no fallback disables shuffling. Normal
+cancellation/failure removes SQLite scratch files; hard-crash leftovers stay in the owned workspace for the
+existing repair flow. A cancelled whole-source build restarts from raw; incomplete output is never published.
+
+The algorithm is recorded as `shuffle_algorithm: sqlite_random128_v1` in **shuffled processed** fingerprints.
+It is deterministic for the source seed and surviving input rows. Changes to the shuffle identity require
+rebuilding affected processed output; downloaded raw folders remain reusable. Changed ordering can change
+held-out membership and downstream Bloom admission. Training reads the resulting Parquet files without
+runtime shuffling.
 
 **Exact dedup** (`lib/stages/exact_dedup.py`) hashes the normalized text (lowercased, whitespace collapsed;
 `normalize: false` for verbatim) and keeps the first occurrence. The "seen" set is a Bloom filter (`rbloom`) under a
@@ -299,13 +374,104 @@ The filter is not persisted: every build refills it from the `hash` column of th
 already on disk, which is exactly the set a full pass would have accumulated, so an incremental build keeps the
 same rows as a full one. Changing `bloom_memory_mb` does not invalidate processed folders (it is a resource knob).
 
+**Dataset-wide Bloom admission** uses the top-level
+`bloom_deduplicate_across_sources: true` (the default) and
+`bloom_dedup_memory_mb: 1024` (MiB). The global filter is an additional allocation;
+source-local `processing.dedup.bloom_memory_mb` retains its existing compatibility
+rules. With the dataset switch false, only the existing source-local path applies.
+The global memory budget changes probabilistic membership and therefore belongs to
+the dataset's processed identity: changing it requires replay into a new snapshot.
+Local candidate folders and shared raw downloads remain reusable. Enabled output lives
+in `.dataset-scopes/<config_hash>/processed/<source>/`; training resolves this complete
+scope through the dataset build descriptor in `snapshots/<config_hash>.json`. Different
+source sets/orders and global policies have independent output folders. The extra disk
+cost is one retained-row copy per dataset scope, including an 8-byte `global_hash` per
+row; source-local candidates remain on disk. The global writer reads at most 4096 rows
+per batch. It runs after the parallel candidate workers join, so its filter does not
+multiply by `num_workers`; source-local filter/worker budgets retain their existing rules.
+The pass is pipelined over three threads (`lib/stages/global_build.py`): a reader decodes
+the next candidate batches, the build thread runs the Bloom pass, a writer publishes the
+previous batch's shard and manifest; the commits are the same, in the same order, as a
+plain loop, and a failed commit leaves the manifest at the last complete one.
+Within one preparation invocation, compatible source transitions reuse the global filter,
+checksum and frontier. Restarting reconstructs that state once from committed key columns,
+then continues at the saved candidate offset. Candidate-generation changes or priority
+replay can require another reconstruction; speculative or failed publication state is
+never reused. Logs distinguish `restored global Bloom state` from `reusing global Bloom state`.
+
+`--global_hash_workers N` optionally computes normalized document keys in N spawn processes.
+The default `1` hashes in the parent without creating a pool. Admission stays ordered in the
+parent, and only the parent writer publishes files. The setting changes neither dataset
+identity nor shard boundaries and can change between restarts. `--pass_workers`,
+`--num_workers`, and `--tokenizer_threads` do not control this final hashing stage.
+Training auto-preparation retains the serial default.
+
+The hash window holds at most N unadmitted batches of 4,096 rows, in addition to the
+existing reader/writer queues. This is a batch limit, not a byte limit: long texts,
+serialization and worker normalization make additional copies. Try 2 or 4 workers only
+after measuring representative input; more processes can be slower for short documents.
+Cancellation discards speculative hashes and preserves committed progress; ordinary
+shutdown waits for active worker tasks. Complete snapshots and download-only/dry runs
+create no global hash pool. Workers do not publish dataset files.
+
+To change hashing concurrency, stop preparation gracefully, wait for exit, and rerun the same
+command/config/dataset directory with the chosen `--global_hash_workers` value. Restarting reconstructs the
+filter once. See the [offline benchmark](../tools/data_preparation/README.md#final-cross-source-admission-benchmark)
+for comparisons on representative inputs.
+
+Source-local `processed/` folders are candidates, not proof of global readiness. Status
+and dry-run show a missing dataset-wide frontier until preparation replays them; raw
+redownloads are not required. An incomplete partial `--sources` request
+fails before content mutation and asks for the full dataset scope. Once the coherent
+snapshot is complete, a partial no-op request is allowed. Download-only preparation
+retains the existing measured-size top-up rounds.
+
+A source consumes its existing preprocessing unit, retaining unique surplus rows, then
+checks its global budget. Shortfalls extend local candidates from buffered raw before
+fetching more. Top-ups finish the current priority source before lower-priority
+admission; shuffled/MinHash candidate changes replay that source and generation-bound
+downstream output. An exhausted source's shortfall is reported. A zero-yield source gets
+bounded further attempts because later rows may be unique; lack of raw progress or the
+five-round limit stops before lower-priority output and leaves the snapshot incomplete.
+
+Priority is validation-only sources first, followed by all training sources in YAML
+declaration order (`validation-only-then-declaration-v1`). Each source must reach
+its retained budget or exhaustion before the next source can reserve a global key.
+Local quality/length filtering, instruction transformations and optional MinHash
+run before global admission; rejected candidates reserve nothing. Candidate order
+is the existing source preprocessing order, including its deterministic shuffle.
+Worker completion order never selects the winner.
+
+The installed rbloom version and splitmix64 mixing policy are recorded and frozen
+for each build/restart. The versioned global key
+(`normalized-tagged-json-sha256-64-v1`) lowercases text
+and collapses whitespace runs. It ignores source names and source-local
+`dedup.normalize` overrides. A tagged JSON array preserves instruction/input/output
+boundaries, includes the complete answer, and treats null/missing input as empty.
+Equal prompts with different answers survive separately. Prose and structured
+instruction rows have distinct format tags, even when rendered prose looks alike.
+This does not detect embedded text or semantic/near duplicates. A Bloom-positive
+rejection can be a false positive; counters use `bloom_positive`, not confirmed
+duplicate counts. The nominal target FPR is 0.1%; overload beyond twice nominal
+capacity fails with a global-memory/replay remedy.
+
+The admission component commits a bounded row batch together with a deterministic
+frontier. Its recovery stream is the separately stored `global_hash` column from
+exactly committed retained rows; a SHA-256 digest detects mismatched recovery keys.
+A failed publication poisons the live admission instance, requiring recovery from
+the durable frontier so an uncommitted reservation cannot steal a rightful sample.
+Optional [benchmark seeding](#optional-exact-benchmark-copies-in-the-shared-bloom-filter) inserts
+configured benchmark keys before source admission.
+
+**Minhash** deliberately uses approximate matching: the threshold tunes LSH candidate discovery, not a verified
+Jaccard cutoff. Below-threshold removals and missed duplicates are possible. The shipped dataset configs
+use Bloom-based `mode: exact` instead.
+
 **Minhash** (`dedup: {mode: minhash, threshold: 0.95, num_perm: 256, ngram: 5}`, `lib/stages/fuzzy_dedup.py`,
 `datasketch` extra) runs the exact pass first and then MinHash/LSH near-duplicate removal over the whole source at
 once (the LSH index needs every signature; documents shorter than one n-gram pass through). It is **not meant for
 large sources**: an all-or-nothing pass every time the source changes and roughly 4 GB of RAM per million kept rows
-at `num_perm: 256`, over 10 GB for fineweb-edu at the crow budget. The thesis run had it on; the crow config has it
-off. Fuzzy dedup at scale is what `datatrove` or `rensa` are for; wiring one of them in is not planned. It applies
-to **pretrain sources only**: a config that puts an instruct source under `mode: minhash` is rejected when it is
+at `num_perm: 256`. It applies to **pretrain sources only**: a config that puts an instruct source under `mode: minhash` is rejected when it is
 loaded (it would silently get exact dedup), so ask for minhash in the `processing` block of each pretrain source
 rather than in the dataset-level one.
 
@@ -332,7 +498,8 @@ report (`RepairReport`) lists every action with whether it was carried out (`per
   tokenizer, `dataset_max_sequence_length`, ...; the prompt lists the fields) joins the confirmation like a raw
   deletion, as does a manifest that cannot be parsed (the build refuses such a folder until then). Broken shards,
   unlisted shards, a missing manifest, a folder built from raw shards that no longer exist or whose raw folder is
-  being deleted, and a leftover `.tmp` folder are deleted without asking.
+  being deleted, and proven owned incomplete build artifacts are deleted without asking. Ambiguous legacy
+  `.tmp`/`.old` folders are preserved and reported as errors.
 
 Nothing is touched until every folder was inspected; the queued confirmations are answered **once**, with one
 list ("The following folders will be deleted, truncated or re-labelled (...): fineweb_edu: outdated:
@@ -492,6 +659,14 @@ last a `SharedLoaderParameters`: token, index directory, file callback, download
 | `local` | your own data | `path:` directory of `*.parquet`, `*.jsonl` (plain, `.zst` or `.gz`), `*.json.gz` or `*.json` files (the Hub reader's formats), read in sorted file order |
 | `synthetic` | tests / smoke runs | random-word rows from `seed:` |
 
+For `hf_files` / `github_code`, each active file index reads sizes, cached files and remote ranges at the
+immutable commit returned with its listing. A branch moving during a preparation session cannot change
+that session's input files. Reopening a persisted index in a fresh process still checks the requested revision
+and fails with repair/pinning instructions if it moved; legacy indexes adopt and record the current commit
+once before reads. Requested revisions and index cache paths retain their existing meaning. Hub HTTP
+clients receive a 30-second default timeout when created, including after connection-error replacement;
+explicit library request timeouts take precedence.
+
 Pretrain sources need a text column (`text_field`, default `text`); instruct sources need either
 `fields: {instruction: <col>, input: <col>, output: <col>}` (input optional) or a `converter`. Converters and filters
 (`lib/sources/converters.py`) turn one source row into the row the pipeline expects: `gsm8k_question_answer`
@@ -501,8 +676,28 @@ Pretrain sources need a text column (`text_field`, default `text`); instruct sou
 `check_limit` bounds the rows inspected). Write a new converter when the source's schema is not a simple column
 mapping: add a function `(row) -> row` to `converters.py`, register it in `CONVERTERS` (or `FILTERS`), test it on a
 hand-written row in `test_sources.py`, and reference it by name in the YAML. For an instruct source a converter
-raising `ValueError` skips the row (counted in the manifest as `skipped_malformed`); for a pretrain source it fails the
+or filter raising `ValueError` skips the row (counted in the manifest as `skipped_malformed`); for a pretrain source it fails the
 download (a pretrain converter maps whole columns, a failing row means a wrong mapping).
+
+`sharegpt_conversations` deliberately keeps **the first complete opening exchange**, optionally preceded by one
+system turn: `[system,] human, gpt`. It emits one instruction/input/output row. Later turns are ignored,
+including unanswered questions and later system messages; they cannot replace either side or its context.
+Malformed openings (missing keys, unsupported roles/value containers, repeated roles, orphan answers, incomplete
+pairs) raise `ValueError`; the converter does not search forward for a usable pair. Scalar values retain text
+conversion and null becomes empty. `sharegpt_quality` checks that same pair and retains its original eligibility:
+a system-prefixed row is rejected, each side must have 50–2000 characters, and the answer must not contain the
+listed Python/Java/C++/JavaScript code-block markers. The filter requires this converter without a fields override.
+Malformed input uses the warning/counter mechanism and repeated malformed rows fail the source, while ordinary
+quality rejections do not count as malformed.
+
+An opening GPT answer (also after one initial system turn) is a known unsuitable conversation: download skips
+the entire sample and logs a warning, even for a long run of such rows. These skips remain in the manifest's
+`skipped_malformed` count but neither extend nor reset the source-schema failure streak. Missing keys, unsupported
+roles and invalid value types use the source-schema failure threshold.
+
+This policy is recorded as `row_semantics.sharegpt_exchange: first_opening_exchange_v2` in affected raw identities.
+Raw folders with a different conversion identity require confirmed redownload and rebuilding: processing alone
+cannot recover conversation history discarded during download.
 
 ### A local dataset
 
@@ -538,17 +733,97 @@ the order they run in.
   `estimate` uses chars / 4; both add the two special tokens the trainer puts around a row. Instruct rows are
   counted whole, as the trainer formats them (instruction, input and output joined by blank lines).
 
-## Differences from the thesis run
+### Optional exact benchmark copies in the shared Bloom filter
 
-The thesis data was prepared with exact dedup, fuzzy dedup at Jaccard 0.95, tokenizer counts truncated to 2048
-tokens and the quality filter, decontamination and PII masking skipped; the pretrain sources were fetched as fixed
-row counts (e.g. 9.0M fineweb-edu documents) and the finetune data as a 400k-example mixture built up front. The
-crow config mirrors that with exact dedup on, `dataset_max_sequence_length` 2048 and everything else off, but: fuzzy dedup is
-off by default (available as `dedup: {mode: minhash, threshold: 0.95}`), PII masking no longer exists, texts are
-truncated at the token cap when downloaded instead of stored whole, download sizes follow the token budgets
-(÷ the measured tokens per row, × 1.2) instead of fixed row counts, the finetune stage mixes the eight instruct sources by weight in the
-dataloader (no prebuilt mixture, no cross-source dedup of instruct data), validation is the first 5 % of the
-fineweb-edu training source (`validation_fraction`) instead of fineweb-edu's `sample-10BT` (which overlapped the
-training dump: about a fifth of that validation set was training data), several HuggingFace ids moved
-(`wikimedia/wikipedia`, `openai/gsm8k`, `common-pile/arxiv_papers_filtered`) and every source is pinned to a
-revision. `docs/data_mixture.md` lists the resulting budgets.
+`bloom_deduplicate_across_sources_add_benchmarks: []` is off by default. A nonempty
+list requires `bloom_deduplicate_across_sources: true`. Names are validated and
+sorted/deduplicated; unknown names, unavailable/empty splits and invalid examples
+fail before tokenizer publication, repairs or dataset output publication. Download-only,
+status, dry-run and already-complete snapshot checks do not fetch seed material.
+
+| Friendly name | Pinned registry entry | Included evaluation split |
+| --- | --- | --- |
+| `arc_challenge` | `allenai/ai2_arc`, `ARC-Challenge` | `test` |
+| `hellaswag` | `Rowan/hellaswag` | `validation` (labelled) |
+| `mmlu` | `cais/mmlu`, `all` | `test`, all subjects in the aggregate config |
+| `winogrande` | `allenai/winogrande`, `winogrande_xl` | `validation` (labelled) |
+
+Revisions reuse `lib/stages/benchmarks.py`'s pinned registry. HellaSwag and WinoGrande
+use their labelled validation splits; their public test splits have no usable
+answers. No training, development or few-shot splits are silently included.
+
+The adapters deliberately seed only two **complete-example** representations:
+
+1. An instruction record with `instruction=prompt`, `input=""`, and
+   `output="<label>. <answer text>"`.
+2. A pretrain record with `text=prompt + "\nAnswer: <label>. <answer text>"`.
+
+The prompt contains the complete question/context followed by one choice per line,
+`<label>. <choice text>`. ARC retains its original labels. MMLU and HellaSwag use
+A/B/C/D; WinoGrande uses 1/2. MMLU prepends `Subject: <subject>\n`; HellaSwag
+prepends `Activity: <activity_label>\n` to its full `ctx`. WinoGrande retains the
+sentence's underscore. IDs and other metadata are ignored; redundant HellaSwag
+`ctx_a`/`ctx_b` are represented by `ctx`. For example:
+
+```text
+Which planet?
+A. Earth
+B. Mars
+Answer: B. Mars
+```
+
+The shared key policy lowercases and collapses whitespace independently within
+each field; pretrain and instruction formats remain distinct. Changed answers or
+choices, label-only outputs, extra wrappers, omitted subject/activity headers,
+questions embedded in long documents, and paraphrases can remain. This is exact
+whole-example key exclusion with Bloom false positives, **not a benchmark-clean
+corpus guarantee**. No prompt-only, answer-only, substring or semantic matching
+is enabled. The separate optional `processing.decontamination` n-gram filter can
+coexist with this setting; neither setting activates or replaces the other.
+
+Every record's two keys are inserted directly, including repeated records. A
+streamed, temporary packed-key spool bounds Python memory and never rewrites the
+benchmark sources. Seeds precede every dataset source and are reloaded on recovery.
+Their count and ordered digest enter the committed initial frontier and must match
+on restart. Names, repositories, configs, revisions, splits, adapter/key versions
+and filter settings enter dataset identity; changing them requires a new scoped
+output replay through the normal preparation/repair lifecycle. Source-local
+candidates and raw folders remain reusable, and older snapshots keep their identity.
+
+Logs report configured sets and insertion counts; manifests expose the seed policy,
+`preseed_count`, filter memory, nominal capacity and maximum load. Capacity includes
+all seed insertions plus retained dataset keys, counting repeated seeds
+conservatively. `bloom_positive` combines seed matches, dataset duplicates and false
+positives. A shared Bloom filter cannot attribute a removal to an individual
+benchmark or prove that a positive was a true match.
+
+### Multi-turn instruction sources
+
+The opt-in `instruction_format: messages` supports OpenCodeInstruct (perfect recorded test score), current WebInstruct-verified training pairs, and Nemotron reasoning-off chats. It preserves all fitting exchanges and trains only assistant responses. Existing single-turn sources are unchanged. See [conversation formatting and filtering](../docs/instruction_conversations.md) and [the small four-source integration config](../config/datasets/instruction_sources_smoke.yaml). Use an isolated dataset directory for this smoke config; the selected FineWeb pool is 350BT, but preparation is sized by the small stage budgets.
+
+### Inspect raw, prepared, and packed samples
+
+Run the actual stages on a small retained sample from every source:
+
+```bash
+uv run --no-sync python -m data_preparation.inspection \
+  --dataset_config config/datasets/instruction_sources_smoke.yaml \
+  -n 10 --sequence-length 4096 --pack-length 8192
+```
+
+The command prints a **retained temporary directory** at startup. It does not delete it on exit. Optional `--output-dir /path/to/new-directory` chooses a fresh location; existing directories are refused. `HF_TOKEN` supplies gated-source access. Source jobs run sequentially, cleaning uses one worker, and download read-ahead is disabled. Original quality, source-local dedup, and global Bloom policies remain active. The stage token budgets are not downloaded in full.
+
+`-n` targets retained **raw** rows after the normal downloader's conversion, filtering, and storage-length handling. The preparer may retain fewer. Instruction sources may examine up to `max(1000, 100*n)` upstream rows (override with `--max-source-rows`, also bounded by the config's `check_limit`). A source shortfall is recorded and warned about. These are row limits, not byte limits: Parquet column chunks/row groups can require larger transfers. Dataset policies such as benchmark seeding may also require their normal auxiliary downloads.
+
+Start with `README.txt` and `summary.json` in the printed directory. Artifacts include:
+
+- `dataset/`: normal raw/processed Parquet shards and manifests, including globally deduplicated output when enabled.
+- `raw/` and `prepared/`: readable JSONL copies for each source.
+- `formatted/`: each sample has a `tokens` list of `[input_id, label, loss_mask, decoded_token]` rows before next-token shifting, one token per line, alongside its source ID, prepared-row index, and split.
+- `packed/sources/`: each source's usable samples packed once.
+- `packed/mixed/`: every usable sample packed once in interleaved source order, including held-out rows for inspection.
+- `packed/stages/`: two previews per stage using the real training `BatchStream` and training rows only; finite samples cycle as needed. Adjust with `--packs-per-stage` (`0` disables).
+
+Each pack is saved as `.pt` tensors, `.json` token rows, `.tsv` per-token input/next-target/mask, and `.txt` decoded text with loss spans. Packed JSON uses the same `tokens: [[input_id, label, loss_mask, decoded_token], ...]` layout as `formatted/`, one row per line, but **after** the next-token shift: `label` is the next-token target, and `decoded_token` describes the input. Special tokens stay visible; padding is identified. The JSON/tensors include positions and document IDs for the causal document mask, avoiding a quadratic matrix dump.
+
+Finite packing drains a partial final pool so no sample is hidden. Stage previews start independently with each stage's steady weights; they do not reproduce transitions, production dataset order, or checkpoint offsets. A stage missing usable training examples is explicitly skipped, not reweighted. This is an inspection fixture, not a training-ready dataset snapshot. Production dataset directories remain untouched.

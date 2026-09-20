@@ -212,6 +212,11 @@ def test_evaluate_scores_every_depth_on_the_same_batches(
     assert delivered == [0, 1, 2]  # `eval_iters` batches, each pulled from the loader exactly once
     assert len(scored) == 3  # two partial depths plus the mean recurrence
     assert all(indices == [0, 1, 2] for indices in scored.values()), scored
+    # A later validation restarts the iterable; it does not retain a cursor after the first eval_iters batches.
+    torch.rand(17)
+    evaluate(settings, cpu_backend, tiny_model, RecordingLoader())
+    assert delivered == [0, 1, 2, 0, 1, 2]
+    assert all(indices == [0, 1, 2, 0, 1, 2] for indices in scored.values()), scored
 
 
 def test_evaluate_iterates_the_loader_once(
@@ -243,7 +248,7 @@ def test_evaluate_reports_the_per_token_loss_per_validation_source(
 ) -> None:
     """
     `val_loss/<data id>` is the token-weighted mean loss of that source's rows at the mean recurrence, over the
-    batches seen; `val_loss` itself (the mean of the batch means) is unchanged by the bookkeeping.
+    batches seen; their count-weighted aggregate agrees with the overall token mean.
     """
 
     settings.partial_depth_eval = [1]
@@ -274,7 +279,8 @@ def test_evaluate_reports_the_per_token_loss_per_validation_source(
                 sums[data_id][1] += int((y[row] != -100).sum())
     for data_id, (loss_sum, count) in sums.items():
         assert metrics[f"val_loss/{data_id}"].item() == pytest.approx(loss_sum / count, rel=1e-5)
-    assert metrics["val_loss"].item() == pytest.approx(torch.stack(batch_means).mean().item(), rel=1e-5)
+    expected_overall = sum(entry[0] for entry in sums.values()) / sum(entry[1] for entry in sums.values())
+    assert metrics["val_loss"].item() == pytest.approx(expected_overall, rel=1e-5)
     assert metrics["val_loss/a"] != metrics["val_loss/b"]
 
 
@@ -289,7 +295,7 @@ def test_per_source_losses_are_summed_over_the_ranks_whatever_sources_each_saw(
 
     class TwoRankBackend(SingleDeviceBackend):
         def all_gather_object(self, obj: Any) -> list[Any]:  # a second rank that saw source b with 10 tokens and source c
-            other = {"b": torch.tensor([20.0, 10.0]), "c": torch.tensor([3.0, 3.0])}
+            other = {"b": (torch.tensor(20.0), torch.tensor(10)), "c": (torch.tensor(3.0), torch.tensor(3))}
             return [obj, other]
 
     settings.eval_iters = 1
@@ -320,3 +326,61 @@ def test_is_evaluation_step_table(settings: Settings) -> None:
     settings.eval_step_interval = 7
     evaluated = [done for done in range(1, 21) if is_evaluation_step(settings, done, stage_manager)]
     assert evaluated == [7, 14, 20]
+
+
+@pytest.mark.parametrize("training", [False, True])
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_evaluation_restores_exact_module_modes(
+    tiny_model: RecurrentGPT, settings: Settings, cpu_backend: SingleDeviceBackend,
+    monkeypatch: pytest.MonkeyPatch, training: bool, mixed: bool, fail: bool,
+) -> None:
+    tiny_model.train(training)
+    if mixed:
+        tiny_model.transformer.wte.train(not training)
+    flags = [module.training for module in tiny_model.modules()]
+    settings.eval_iters, settings.partial_depth_eval = 1, [1]
+    batches = _batches(1)
+    rng = torch.get_rng_state()
+    original = RecurrentGPT.forward
+
+    def forward(self: RecurrentGPT, *args: Any, **kwargs: Any) -> Any:
+        assert not any(module.training for module in self.modules())
+        assert not torch.is_grad_enabled() and not torch.is_inference_mode_enabled()
+        result = original(self, *args, **kwargs)
+        if fail:
+            raise RuntimeError("validation failure after forward")
+        return result
+
+    monkeypatch.setattr(RecurrentGPT, "forward", forward)
+    if fail:
+        with pytest.raises(RuntimeError, match="validation failure after forward"):
+            evaluate(settings, cpu_backend, tiny_model, batches)
+    else:
+        evaluate(settings, cpu_backend, tiny_model, batches)
+    assert [module.training for module in tiny_model.modules()] == flags
+    assert torch.equal(rng, torch.get_rng_state())
+
+
+def test_validation_leaves_next_training_update_identical(
+    tiny_model: RecurrentGPT, settings: Settings, cpu_backend: SingleDeviceBackend,
+) -> None:
+    from copy import deepcopy
+
+    reference, validated = deepcopy(tiny_model), deepcopy(tiny_model)
+    settings.eval_iters, settings.partial_depth_eval = 1, [1]
+    batches = _batches(1)
+    for model in (reference, validated):
+        model.transformer.wte.eval()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        torch.manual_seed(51)
+        if model is validated:
+            evaluate(settings, cpu_backend, model, batches)
+        output = model(batches[0].input_ids, labels=batches[0].labels)
+        assert output["loss"] is not None
+        output["loss"].backward()
+        optimizer.step()
+    for left, right in zip(reference.parameters(), validated.parameters(), strict=True):
+        assert torch.equal(left, right)
+        assert left.grad is not None and right.grad is not None and torch.equal(left.grad, right.grad)
+    assert [module.training for module in reference.modules()] == [module.training for module in validated.modules()]

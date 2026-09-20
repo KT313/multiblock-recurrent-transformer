@@ -65,7 +65,7 @@ def packed_inputs(tokenizer: Tokenizer, lengths: tuple[int, ...]) -> dict[str, t
 
 def tiny_cuda_model(**kwargs: object) -> RecurrentGPT:
     torch.manual_seed(0)
-    return build_model(TINY_ARCHITECTURE, **kwargs).cuda().train()
+    return build_model(TINY_ARCHITECTURE, **({"use_custom_kernels": False} | kwargs)).cuda().train()
 
 
 def loss_and_grads(

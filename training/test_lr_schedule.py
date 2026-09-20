@@ -81,6 +81,11 @@ def test_no_warmup_and_no_cooldown_is_a_flat_plateau() -> None:
     assert _lr(sm, 20) == pytest.approx(5e-5)  # step == max_steps is still the last stage's LR
 
 
+def test_touching_windows_preserve_exact_lr_values() -> None:
+    sm = StageManager([resolved_stage("s", 10 * TPS, base_lr=6.0)], TPS, warmup_steps=4, cooldown_steps=6)
+    assert [_lr(sm, step) for step in range(12)] == [0.0, 1.5, 3.0, 4.5, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0, 0.0]
+
+
 def test_warmup_ramps_monotonically_to_the_first_stage_lr_up_to_the_transition() -> None:
     """
     The longest allowed warmup (5 of stage a's 6 plain steps) never targets the next stage's LR: no dip.

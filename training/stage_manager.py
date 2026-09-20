@@ -140,7 +140,7 @@ class StageManager:
         """
         Warmup must end before the first stage's transition starts (the ramp targets the first stage's base LR)
         and cooldown must fit inside the last stage; every stage must be at least one step long, with its transition
-        shorter than the stage.
+        shorter than the stage. In a single stage, warmup and cooldown must not overlap (touching is allowed).
         """
 
         for stage, boundary in zip(self.stages, self.boundaries):
@@ -168,6 +168,12 @@ class StageManager:
                     f"cooldown_steps ({self.cooldown_steps}) must be less than last stage steps ({last_stage_steps}). "
                     "Consider reducing cooldown_steps or increasing final stage tokens."
                 )
+        if len(self.stages) == 1 and self.warmup_steps + self.cooldown_steps > self.total_steps:
+            raise ValueError(
+                f"warmup_steps ({self.warmup_steps}) + cooldown_steps ({self.cooldown_steps}) must be <= "
+                f"total optimizer steps ({self.total_steps}): warmup and cooldown must not overlap. "
+                "Reduce warmup_steps or cooldown_steps, or increase the stage's tokens."
+            )
 
     def get_stage_info(self, step: int) -> StageInfo:
         """

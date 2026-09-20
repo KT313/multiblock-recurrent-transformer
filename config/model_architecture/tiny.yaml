@@ -7,9 +7,9 @@
 # Every key below is a tunable field; unknown keys are rejected on load.
 #
 # Fixed in this codebase (not knobs): SandwichBlock layout with RMSNorm, GatedMLP/SiLU, sdpa attention, linear
-# injection adapter, normal latent-state init, poisson-lognormal-filling recurrence sampler, takase orthogonal init,
+# injection adapter, normal latent-state init, poisson-lognormal-filling recurrence sampler, takase init scales,
 # per-iteration activation checkpointing, tied embeddings in the HF wrapper (the dataclass fields attn_impl,
-# init_strategy, init_orthogonal, activation_checkpoint_impl, injection_type, state_init, sampling_scheme accept
+# init_strategy, activation_checkpoint_impl, injection_type, state_init, sampling_scheme accept
 # only that one value and are therefore not listed here).
 
 # Core sizes
@@ -25,6 +25,8 @@ padded_vocab_size: null        # null: vocab_size rounded up to padding_multiple
 tie_embeddings: true           # lm_head shares the token-embedding weights
 
 # Block details
+residual_scaling: none        # inverse_sqrt_depth: scale each sandwich attention/MLP branch by 1/sqrt(expected depth)
+init_orthogonal: true         # false: independent truncated-normal weights at Takase scales (+/-3 std)
 rope_settings:
   rope_base: 50000             # base of the rotary position embedding frequencies
 norm_eps: 1.0e-6               # epsilon of every RMSNorm / LayerNorm (write floats with a dot: YAML reads 1e-6 as a string)
@@ -37,3 +39,6 @@ n_layers_in_coda: 1            # SandwichBlocks after the recurrent core (run on
 n_layers_in_recurrent_block: [1, 1]   # SandwichBlocks per recurrent core block; one entry per core block (here 2 blocks)
 mean_recurrence: [2, 2]        # mean number of iterations per block (training sampler mean and eval depth); one entry per core block
 mean_backprop_depth: [2, 2]    # cap on the iterations with gradients per block (truncated backprop: the last min(sampled depth, this) iterations, so the average is lower); one entry per core block
+
+# Default execution policy for direct model construction; the run config can override it.
+use_custom_kernels: true

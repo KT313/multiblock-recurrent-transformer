@@ -37,6 +37,8 @@ Pure functions of (config, layout); lib/build/runner.py executes them.
 
 from __future__ import annotations
 
+from data_preparation.lib.conversation_format import count_fitted_positions
+
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -45,14 +47,16 @@ from math import ceil
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 
-from data_preparation.dataset_config import SAFETY_MARGIN, DatasetConfig
-from data_preparation.layout import DatasetLayout
+from data_preparation.lib.dataset_config import SAFETY_MARGIN, DatasetConfig
+from data_preparation.lib.layout import DatasetLayout
 from data_preparation.lib.build.assessment import ProcessedAssessment, ProcessedProblem, assess_processed_folder
 from data_preparation.lib.build.repair import RepairError
 from data_preparation.lib.log import get_logger
 from data_preparation.lib.stages.download import RawManifestState, inspect_raw
 from data_preparation.lib.storage.manifest import shard_list, shard_tokens, Manifest
+from data_preparation.lib.storage.tokenizer_assessment import assess_tokenizer_folder
 
 log = get_logger(__name__)
 
@@ -105,10 +109,7 @@ def tokenizer_is_prepared(config: DatasetConfig, layout: DatasetLayout) -> bool:
     """
 
     directory = layout.tokenizer_dir(config.tokenizer.name)
-    manifest = Manifest.load(directory)
-    if manifest is None:
-        return False
-    return manifest.is_current(config.tokenizer_hash()) and (directory / "tokenizer_config.json").is_file()
+    return assess_tokenizer_folder(directory, config.tokenizer_hash()).ready
 
 
 def raw_is_exhausted(config: DatasetConfig, name: str, raw: Manifest) -> bool:
@@ -132,7 +133,8 @@ def assess_processed(config: DatasetConfig, name: str, layout: DatasetLayout, ra
     build read no parquet footers; broken or stray shard files are the repair step's business).
     """
 
-    return assess_processed_folder(config, name, layout.processed_dir(name), shard_list(raw.shards), check_files=False)
+    return assess_processed_folder(config, name, layout.processed_dir(name), shard_list(raw.shards),
+                                   check_files=False, global_output=layout.processed_scope is not None)
 
 
 def build_is_pending(config: DatasetConfig, name: str, layout: DatasetLayout) -> bool:
@@ -142,7 +144,13 @@ def build_is_pending(config: DatasetConfig, name: str, layout: DatasetLayout) ->
     nothing to build from.
     """
 
-    return source_ledger(config, name, layout).build_pending
+    ledger = source_ledger(config, name, layout)
+    if ledger.raw_state != "current" or ledger.build_pending:
+        # Preserve the ledger's repair verdict, including unreadable processed manifests. Without current
+        # raw input there is nothing to build, even when an old output generation was interrupted.
+        return ledger.build_pending
+    manifest = Manifest.load(layout.processed_dir(name))
+    return manifest is not None and not manifest.generation_complete
 
 
 def sources_with_pending_raw_shards(config: DatasetConfig, layout: DatasetLayout, sources: Iterable[str] | None = None) -> list[str]:
@@ -225,9 +233,13 @@ class DatasetReport:
     tokenizer_complete: bool = False
     needs_repair: list[str] = field(default_factory=list)  # sources the repair step would touch (`status` only; `prepare` repaired first)
 
+    snapshot_problem: str | None = None
+    tokenizer_problem: str | None = None
+
     @property
     def complete(self) -> bool:
-        return self.tokenizer_complete and not self.needs_repair and all(source.satisfaction()[0] for source in self.sources)
+        return (self.snapshot_problem is None and self.tokenizer_complete and not self.needs_repair
+                and all(source.satisfaction()[0] for source in self.sources))
 
     def missing(self) -> list[str]:
         """
@@ -238,6 +250,8 @@ class DatasetReport:
         names = [source.name for source in self.sources if not source.satisfaction()[0] or source.name in self.needs_repair]
         if not self.tokenizer_complete:
             names.append("tokenizer")
+        if self.snapshot_problem is not None and not names:
+            names.append(f"dataset snapshot ({self.snapshot_problem})")
         return names
 
     def unsatisfied(self) -> list[SourceLedger]:
@@ -280,7 +294,8 @@ class DatasetReport:
                 source.name, source.kind, f"{source.rows_needed:,}", f"{source.tokens_per_row:,.0f}", f"{source.raw_rows:,}",
                 f"{source.processed_rows:,}", "-" if epochs is None else f"{epochs:.2f}", state, source.satisfaction()[1],
             ))  # fmt: skip
-        rows.append(("tokenizer", "tokenizer", "", "", "", "", "", "complete" if self.tokenizer_complete else "incomplete", ""))
+        rows.append(("tokenizer", "tokenizer", "", "", "", "", "", "complete" if self.tokenizer_complete else "incomplete",
+                     "" if self.tokenizer_problem is None else f"{self.tokenizer_problem}; run prepare with the tokenizer step"))
         return format_table(header, rows)
 
     def describe(self) -> str:
@@ -288,7 +303,8 @@ class DatasetReport:
         The table plus the overall verdict line (dataset complete / dataset INCOMPLETE).
         """
 
-        return self.table() + "\n" + f"dataset {'complete' if self.complete else 'INCOMPLETE'}"
+        detail = f"\ndataset snapshot: {self.snapshot_problem}" if self.snapshot_problem is not None else ""
+        return self.table() + detail + "\n" + f"dataset {'complete' if self.complete else 'INCOMPLETE'}"
 
 
 @dataclass(frozen=True)
@@ -540,9 +556,19 @@ def measured_tokens_per_row(config: DatasetConfig, name: str, layout: DatasetLay
     for shard in raw.shards:
         path = raw_dir / shard.name
         try:
-            capped += shard_tokens(path, cap=config.training_target_sequence_length)
+            if config.sources[name].instruction_format == "messages":
+                parquet = pq.ParquetFile(path)
+                for batch in parquet.iter_batches(batch_size=1024, columns=["exchange_ends"]):
+                    for ends in batch.column(0).to_pylist():
+                        if not isinstance(ends, list):
+                            raise ValueError(f"{name}: missing conversation exchange_ends in {path}")
+                        capped += count_fitted_positions(ends, min(config.training_target_sequence_length, config.dataset_max_sequence_length - 1))
+            else:
+                capped += shard_tokens(path, cap=config.training_target_sequence_length)
         except (OSError, pa.ArrowException) as error:
             raise UnreadableRawShardError(name, path, error) from error
+    if config.sources[name].instruction_format == "messages" and capped == 0:
+        raise ValueError(f"{name}: no stored complete conversation exchange fits training_target_sequence_length={config.training_target_sequence_length}; increase the training length or select shorter conversations")
     return capped / raw.rows()
 
 
@@ -568,9 +594,11 @@ def summarize_dataset_state(config: DatasetConfig, layout: DatasetLayout, *, nee
     needs_repair names the sources a repair dry run would touch (status): they count as incomplete.
     """
 
+    tokenizer = assess_tokenizer_folder(layout.tokenizer_dir(config.tokenizer.name), config.tokenizer_hash())
     return DatasetReport(
         sources=read_ledgers(config, layout),
-        tokenizer_complete=tokenizer_is_prepared(config, layout),
+        tokenizer_complete=tokenizer.ready,
+        tokenizer_problem=tokenizer.problem,
         needs_repair=sorted(set(needs_repair)),
     )
 

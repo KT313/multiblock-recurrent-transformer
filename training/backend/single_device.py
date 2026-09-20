@@ -20,13 +20,14 @@ from torch.optim import Optimizer
 
 from data_preparation.lib.storage.atomic import write_atomically
 from model import RecurrentGPT
+from model.execution import PRECISIONS as SUPPORTED_PRECISIONS, ExecutionPolicy
 from training.backend.base import unwrap_model
+from training.backend.compilation import compile_module
 
 T = TypeVar("T")
+PRECISIONS = SUPPORTED_PRECISIONS  # compatibility export
 
-PRECISIONS = ("bf16-mixed", "32")
 WORLD_SIZE_ENV = "WORLD_SIZE"  # set by torchrun for every rank; more than 1 needs a multi-rank backend
-DYNAMO_RECOMPILE_LIMIT = 32  # per compiled frame; the default 8 is one above what the recurrence iteration needs
 
 
 def _set_torch_flags() -> None:
@@ -51,8 +52,7 @@ class SingleDeviceBackend:
     is_main: bool = True
 
     def __init__(self, device: str | None = None, precision: str = "bf16-mixed") -> None:
-        if precision not in PRECISIONS:
-            raise ValueError(f"precision must be one of {PRECISIONS}, got {precision!r}")
+        self.precision = precision
         self._check_launch_environment()
         if device is None:
             if torch.cuda.is_available():
@@ -61,10 +61,26 @@ class SingleDeviceBackend:
                 warnings.warn("No CUDA device available, falling back to CPU.", stacklevel=2)
                 device = "cpu"
         self.device = torch.device(device)
-        self.precision = precision
         self.pin_memory = self.device.type == "cuda"
         self.wrappers: tuple[str, ...] = ()
         _set_torch_flags()
+
+    @property
+    def execution_policy(self) -> ExecutionPolicy:
+        """The current validated policy; precision assignments replace it atomically."""
+        return self._execution_policy
+
+    @property
+    def precision(self) -> str:
+        precision = self._execution_policy.precision
+        assert precision is not None  # the setter forbids legacy/missing precision for a training backend
+        return precision
+
+    @precision.setter
+    def precision(self, precision: str) -> None:
+        if precision not in PRECISIONS:
+            raise ValueError(f"precision must be one of {PRECISIONS}, got {precision!r}")
+        self._execution_policy = ExecutionPolicy(precision)
 
     def _check_launch_environment(self) -> None:
         """
@@ -83,16 +99,7 @@ class SingleDeviceBackend:
     def setup_model(self, model: Module, compile_model: bool = False) -> Module:
         model = model.to(self.device)
         if compile_model:
-            # The recurrence iteration is compiled as one frame with several legitimate variants (no-grad and grad
-            # iterations, the latent with and without gradient), the checkpointed iteration (`checkpointed_iteration`,
-            # its own frame holding the checkpoint call) likewise; past dynamo's default limit of 8 recompiles it
-            # silently runs the frame eagerly (a warning in the log, a 10 percent slower step).
-            torch._dynamo.config.recompile_limit = DYNAMO_RECOMPILE_LIMIT
-            # dynamic=True: variable sequence lengths (padding multiples) must not trigger recompiles. Packed
-            # training has one shape, but its validation is still padded: a static compile recompiled the forward for
-            # every validation length and ran past the limit into eager (measured: validation three times slower).
-            # torch.compile is typed as returning a bare callable; at runtime it is an OptimizedModule (a Module)
-            model = cast(Module, torch.compile(model, dynamic=True))
+            model = compile_module(model)
         self.wrappers = ("compile",) if compile_model else ()
         return model
 
@@ -103,12 +110,7 @@ class SingleDeviceBackend:
         return optimizer
 
     def autocast(self) -> AbstractContextManager[None]:
-        if self.precision == "bf16-mixed":
-            # torch.autocast is a context manager by protocol only (no AbstractContextManager base in the stubs)
-            return cast(
-                AbstractContextManager[None], torch.autocast(device_type=self.device.type, dtype=torch.bfloat16)
-            )
-        return nullcontext()
+        return self.execution_policy.autocast(self.device)
 
     def backward(self, loss: Tensor) -> None:
         loss.backward()  # type: ignore[no-untyped-call]  # Tensor.backward is unannotated in torch

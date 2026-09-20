@@ -4,7 +4,7 @@ Batch collation in two halves: `collate_samples` tokenizes rows into unpadded sa
 and `pad_and_shift` turns a list of samples into one padded, shifted micro-batch (in the main process).
 
 `collate_fn` composes the two for the padded validation loaders. The training loaders stop after the first half:
-their workers hand out unpadded samples (`collate_worker_batch`) that `training.step.BatchStream` packs into one
+their workers hand out unpadded samples (`collate_worker_batch`) that `training.steps.BatchStream` packs into one
 row per micro-batch (`training.data.packing`).
 """
 
@@ -12,8 +12,8 @@ from typing import Any, NamedTuple
 
 import torch
 
-from training.data.formats import apply_formatting
-from training.data.tokenizer import IGNORE_INDEX, Tokenizer
+from training.data.formats import apply_formatting, format_conversation
+from training.data.tokenizer import IGNORE_INDEX, TokenMetadata, Tokenizer
 
 Sample = tuple[torch.Tensor, torch.Tensor, str]  # one unpadded, unshifted row: (input_ids, labels, data_id)
 
@@ -63,7 +63,7 @@ def shift_inputs_and_labels(inputs: torch.Tensor, labels: torch.Tensor) -> tuple
     return input_ids, label_ids
 
 
-def mask_label_ids(label_ids: torch.Tensor, tokenizer: Tokenizer, ignore_index: int = IGNORE_INDEX) -> torch.Tensor:
+def mask_label_ids(label_ids: torch.Tensor, tokenizer: TokenMetadata, ignore_index: int = IGNORE_INDEX) -> torch.Tensor:
     """
     Shifted labels as the loss sees them: ids outside the tokenizer's vocabulary become `ignore_index`, in place;
     returns `label_ids`. `IGNORE_INDEX` (padding, masked prompts) is negative, so it passes through unchanged.
@@ -107,7 +107,10 @@ def collate_samples(
     max_tokens = training_max_sequence_length + 1
     samples: list[Sample] = []
     for row in batch:
-        input_ids, labels = apply_formatting(row, tokenizer, add_bos, add_eos)
+        if row["data_signature"]["format_fn"] == "format_conversation":
+            input_ids, labels = format_conversation(row, tokenizer, add_bos, add_eos, max_tokens)
+        else:
+            input_ids, labels = apply_formatting(row, tokenizer, add_bos, add_eos)
         if input_ids.shape[0] > max_tokens or labels.shape[0] > max_tokens:
             # cloned, not sliced: a slice is a view that keeps the WHOLE stored row alive (rows are stored cut at
             # dataset_max_sequence_length, trained cut at training_max_sequence_length), and `torch.save` writes a

@@ -15,8 +15,6 @@ import pyarrow.compute as pc
 
 Row = dict[str, Any]
 
-_WHITESPACE = re.compile(r"\s+")
-
 
 # --- pretrain: length filter -------------------------------------------------------------------------------------------
 
@@ -111,10 +109,13 @@ def _unique_ratio(items: list[str]) -> float:
 
 def normalize_text(text: str) -> str:
     """
-    Lowercase and collapse whitespace (for contamination checks).
+    Lowercase and collapse whitespace runs to one space, none at the ends (the exact-dedup key of pretrain rows,
+    the global admission key and the contamination n-grams). str.split() without a separator splits on exactly the
+    code points the regex \\s matches and drops empty pieces, so this equals `re.sub(r"\\s+", " ", ...).strip()`
+    (pinned in test_row_pipeline.py) at about three times the speed: the build spends most of its per-row time here.
     """
 
-    return _WHITESPACE.sub(" ", text.lower()).strip()
+    return " ".join(text.lower().split())
 
 
 def get_ngram_set(text: str, n: int = 13) -> set[str]:

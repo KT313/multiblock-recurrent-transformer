@@ -5,9 +5,10 @@ Thin wrapper around a saved tokenizer directory (tokenizer.json + tokenizer_conf
 """
 
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 from data_preparation.lib.stages.tokenizer_loader import SavedTokenizer
+from data_preparation.lib.storage.tokenizer_assessment import tokenizer_files_problem
 
 # Label value of positions without a loss (padding, masked prompts, out-of-vocab); the model defaults to it too.
 # Never a token id: a real `<unk>` or `<pad>` token in a document is a supervised label like any other.
@@ -63,10 +64,14 @@ class Tokenizer:
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
-        if not (self.path / "tokenizer.json").is_file():
-            raise FileNotFoundError(f"No tokenizer.json in {self.path}")
+        problem = tokenizer_files_problem(self.path)
+        if problem is not None:
+            raise FileNotFoundError(f"{problem}; run data_preparation/prepare.py prepare "
+                                    "with the dataset config and tokenizer step to repair it")
         self._backend = SavedTokenizer(self.path)
         self._processor: Any = None
+        self.contract = self._backend.contract
+        self.profile = self._backend.profile
         bos_id, eos_id = self._backend.bos_id, self._backend.eos_id
         if bos_id is None or eos_id is None:
             raise ValueError(f"Tokenizer at {self.path} must define a BOS and an EOS token")
@@ -84,6 +89,10 @@ class Tokenizer:
         # pad_id is never a label (generation pads with it, training pads inputs with EOS), so it is not bounded here
         self.pad_id: int = resolve_pad_id(self._backend, self.eos_id)
 
+    def encode_literal(self, text: str) -> list[int]:
+        """Encode literal chat content through the shared tokenizer policy."""
+        return self._backend.encode_literal(text)
+
     @property
     def processor(self) -> Any:
         """
@@ -96,9 +105,9 @@ class Tokenizer:
         """
 
         if self._processor is None:
-            from transformers import AutoTokenizer
+            from tokenization.profile import load_processor
 
-            processor = AutoTokenizer.from_pretrained(str(self.path), add_bos_token=True, add_eos_token=False)
+            processor = load_processor(self.path, add_bos_token=True)
             check_automatic_bos(processor, self.bos_id, self.path)
             self._processor = processor
         return self._processor
@@ -106,7 +115,7 @@ class Tokenizer:
     @property
     def vocab_size(self) -> int:
         """
-        Size of the base vocabulary (without added tokens), used to mask out-of-range labels.
+        Valid-label bound: the verified profile's usable size, or the historical base size for legacy tokenizers.
         """
 
         return self._backend.vocab_size
@@ -135,3 +144,15 @@ class Tokenizer:
 
     def decode(self, ids: list[int], skip_special_tokens: bool = False) -> str:
         return self._backend.decode(ids, skip_special_tokens=skip_special_tokens)
+
+
+class TokenMetadata(Protocol):
+    """
+    Vocabulary metadata consumed by tensor packing and masking; both a Tokenizer and synthetic metadata satisfy it.
+    """
+
+    @property
+    def vocab_size(self) -> int: ...
+
+    @property
+    def eos_id(self) -> int: ...

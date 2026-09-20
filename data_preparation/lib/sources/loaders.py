@@ -24,7 +24,8 @@ from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol
 
-from data_preparation.dataset_config import DEFAULT_TOKENS_PER_ROW_ESTIMATE, SourceConfig
+from data_preparation.lib.identifiers import validate_identifier
+from data_preparation.lib.dataset_config import DEFAULT_TOKENS_PER_ROW_ESTIMATE, SourceConfig
 from data_preparation.lib.sources.hub_files import (
     DEFAULT_MAX_CACHED_FILE_MB,
     FORMATS,
@@ -57,6 +58,7 @@ class SharedLoaderParameters:
     stats: FetchStats | None = None
     columns: list[str] | None = None
     align_to_row_group: bool = True
+    download_prefetch_mb: int = 0
 
 
 class Loader(Protocol):
@@ -173,7 +175,8 @@ def hub_fetcher(source: SourceConfig, shared_parameters: SharedLoaderParameters)
 
     threshold = source.load_kwargs.get(MAX_CACHED_FILE_KEY, DEFAULT_MAX_CACHED_FILE_MB)
     return HubFetcher(
-        token=shared_parameters.token, max_cached_file_mb=float(threshold), stats=shared_parameters.stats or FetchStats()
+        token=shared_parameters.token, max_cached_file_mb=float(threshold), stats=shared_parameters.stats or FetchStats(),
+        prefetch_bytes=shared_parameters.download_prefetch_mb * 1024 * 1024,
     )
 
 
@@ -286,7 +289,7 @@ def github_code_extra_name(template: SourceConfig, language: str) -> str:
     if not template.hf_id:  # validated by SourceConfig; repeated for the type checker
         raise ValueError("github_code_extra_name needs a template with hf_id")
     repo = re.sub(r"[^a-z0-9]+", "_", template.hf_id.rsplit("/", 1)[-1].lower()).strip("_")
-    return f"{repo}_{language_slug(language)}"
+    return validate_identifier(f"{repo}_{language_slug(language)}", field="generated source name")
 
 
 def github_code_extra_source(template: SourceConfig, language: str) -> SourceConfig:

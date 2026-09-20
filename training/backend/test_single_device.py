@@ -8,12 +8,14 @@ import random
 import warnings
 from contextlib import nullcontext
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
 import torch
 
 from model import RecurrentGPT
+from model.execution import ExecutionPolicy
 from training.backend import BACKENDS, get_backend
 from training.backend.base import Backend
 from training.backend.single_device import SingleDeviceBackend
@@ -68,10 +70,37 @@ def test_explicit_device_does_not_warn() -> None:
     assert backend.device == torch.device("cpu")
 
 
-def test_invalid_precision_raises() -> None:
+@pytest.mark.parametrize("precision", ["fp16", None])
+def test_invalid_precision_raises(precision: Any) -> None:
     assert PRECISIONS == ("bf16-mixed", "32")
     with pytest.raises(ValueError, match="precision"):
-        SingleDeviceBackend(device="cpu", precision="fp16")
+        SingleDeviceBackend(device="cpu", precision=precision)
+
+
+
+def test_precision_assignment_updates_execution_and_policy() -> None:
+    backend = SingleDeviceBackend(device="cpu", precision="32")
+    for precision in ("bf16-mixed", "32", "bf16-mixed"):
+        backend.precision = precision
+        assert backend.precision == precision and backend.execution_policy == ExecutionPolicy(precision)
+        with backend.autocast():
+            out = torch.nn.functional.linear(torch.ones(2, 4), torch.ones(3, 4))
+        assert out.dtype == (torch.bfloat16 if precision == "bf16-mixed" else torch.float32)
+    backend.precision = "32"
+    with torch.autocast("cpu", dtype=torch.bfloat16), backend.autocast():
+        assert torch.is_autocast_enabled("cpu")  # assigning 32 retains the existing ambient-context behavior
+
+
+@pytest.mark.parametrize("precision", ["fp16", None])
+def test_invalid_precision_assignment_keeps_existing_policy(precision: Any) -> None:
+    backend = SingleDeviceBackend(device="cpu", precision="bf16-mixed")
+    original = backend.execution_policy
+    with pytest.raises(ValueError, match="precision"):
+        backend.precision = precision
+    assert backend.precision == "bf16-mixed" and backend.execution_policy is original
+    with backend.autocast():
+        assert torch.is_autocast_enabled("cpu")
+    assert ExecutionPolicy(None).precision is None  # legacy inference remains valid
 
 
 def test_set_torch_flags() -> None:

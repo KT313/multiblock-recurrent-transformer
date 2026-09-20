@@ -22,14 +22,14 @@ import pyarrow.parquet as pq
 import pytest
 import yaml
 
-from data_preparation.dataset_config import (
+from data_preparation import (
     DatasetConfig,
+    DatasetLayout,
     SourceConfig,
     StageConfig,
     TokenizerConfig,
     load_dataset_config,
 )
-from data_preparation.layout import DatasetLayout
 from data_preparation.lib.abort import BuildAborted
 from data_preparation.lib.build.planner import DatasetReport, UnreadableRawShardError
 from data_preparation.lib.storage.manifest import MANIFEST_NAME
@@ -254,8 +254,8 @@ FRAMEWORK_NEUTRAL_MODULES = (
     "training.stage_manager",
     "training.lr_schedule",
     "training.data.dataset_resolver",
-    "data_preparation.dataset_config",
-    "data_preparation.layout",
+    "data_preparation.lib.dataset_config",
+    "data_preparation.lib.layout",
 )
 
 
@@ -593,7 +593,7 @@ def test_resolve_dataset_checks_the_disk_independently_of_the_planner(tmp_path: 
 
     monkeypatch.setattr(resolver_module, "status", lambda config_path, dataset_dir, **kwargs: DatasetReport(tokenizer_complete=True))
     root = tmp_path / "ds"
-    expected_folder = re.escape(str(DatasetLayout(root).processed_dir("synthetic_pretrain")))
+    expected_folder = re.escape(str(DatasetLayout(root).for_config(load_dataset_config(TINY_DATASET_YAML)).processed_dir("synthetic_pretrain")))
     with pytest.raises(FileNotFoundError, match=f"source 'synthetic_pretrain' \\(stage keys pretrain_a.train, pretrain_b.train, pretrain_a.val, pretrain_b.val\\): processed folder {expected_folder} does not exist"):
         resolve_dataset(_settings(TINY_DATASET_YAML, root, auto_prepare=False))
 
@@ -607,7 +607,7 @@ def test_an_unlisted_shard_is_reported_as_repairable_and_healed_by_auto_prepare(
 
     root = tmp_path / "ds"
     shutil.copytree(tiny_dataset_dir, root)
-    folder = DatasetLayout(root).processed_dir("synthetic_instruct")
+    folder = DatasetLayout(root).for_config(load_dataset_config(TINY_DATASET_YAML)).processed_dir("synthetic_instruct")
     shutil.copy(folder / "data-00000.parquet", folder / "data-00001.parquet")
     with pytest.raises(RuntimeError, match="not prepared .*auto_prepare is off.*synthetic_instruct"):
         resolve_dataset(_settings(TINY_DATASET_YAML, root, auto_prepare=False))
@@ -690,7 +690,24 @@ def test_auto_prepare_off_on_empty_dir_raises_with_build_command(tmp_path: Path)
     assert build_command(str(TINY_DATASET_YAML), str(empty)) in message
     assert f"python data_preparation/prepare.py prepare --dataset_config {TINY_DATASET_YAML} --dataset_dir {empty}" in message
     assert "Missing: synthetic_pretrain, synthetic_instruct, tokenizer" in message and "raw missing" in message
-    assert not empty.exists() or not any(empty.iterdir())  # nothing was written
+    assert {p.name for p in empty.iterdir()} == {".build.lock"}  # only an empty coordination file was created
+
+
+@pytest.mark.parametrize("auto_prepare", [False, True])
+def test_resolution_with_an_existing_reader(tiny_dataset_dir: Path, auto_prepare: bool) -> None:
+    from data_preparation.lib.build.lock import RunLocked, build_lock, dataset_lock
+
+    settings = _settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=auto_prepare)
+    before = {p: (p.stat().st_size, p.stat().st_mtime_ns) for p in tiny_dataset_dir.rglob("*") if p.is_file()}
+    with dataset_lock(tiny_dataset_dir, shared=True):
+        if auto_prepare:
+            with pytest.raises(RunLocked):
+                resolve_dataset(settings)
+        else:
+            assert resolve_dataset(settings).train_sources
+        with pytest.raises(RunLocked), build_lock(tiny_dataset_dir):
+            pass
+    assert before == {p: (p.stat().st_size, p.stat().st_mtime_ns) for p in tiny_dataset_dir.rglob("*") if p.is_file()}
 
 
 @pytest.mark.slow
@@ -701,7 +718,7 @@ def test_auto_prepare_builds_tiny_on_empty_dir(tmp_path: Path, caplog: pytest.Lo
     assert "preparing missing data" in caplog.text
     assert caplog.text.count("dataset status:") == 2  # once before the build (incomplete), once after it (complete)
     assert re.search(r"source synthetic_pretrain: \d+ processed rows, rows \[0, \d+\) validation \(5.0%\)", caplog.text)
-    layout = DatasetLayout(empty)
+    layout = DatasetLayout(empty).for_config(resolved.config)
     assert list(layout.processed_dir("synthetic_pretrain").glob("*.parquet"))
     assert list(layout.processed_dir("synthetic_instruct").glob("*.parquet"))
     assert Path(resolved.tokenizer_dir).is_dir()
@@ -732,16 +749,15 @@ class _FakeBackend:
         self.world_size = 1  # the resolver reads it for `check_validation_batches`
         self.barriers = 0
 
+    def all_gather_object(self, obj: Any) -> list[Any]:
+        return [obj]
+
     def barrier(self) -> None:
         self.barriers += 1
 
 
 @pytest.mark.slow
 def test_auto_prepare_builds_on_main_rank_only_and_barriers(tmp_path: Path) -> None:
-    worker = _FakeBackend(is_main=False)
-    with pytest.raises(RuntimeError, match="still incomplete after preparing"):
-        resolve_dataset(_settings(TINY_DATASET_YAML, tmp_path / "worker"), worker)  # nobody built it
-    assert worker.barriers == 1 and not (tmp_path / "worker" / "sources").exists()
     main = _FakeBackend(is_main=True)
     resolved = resolve_dataset(_settings(TINY_DATASET_YAML, tmp_path / "main"), main)
     assert main.barriers == 1 and Path(resolved.tokenizer_dir).is_dir()
@@ -826,6 +842,7 @@ def _resolved(config_hash: str, validation_rows: dict[str, int], source_rows: di
     return ResolvedDataset(
         config=load_dataset_config(TINY_DATASET_YAML),
         config_hash=config_hash,
+        dataset_build_id="test-build",
         tokenizer_dir="unused",
         stages=[],
         train_sources=[],
@@ -844,6 +861,7 @@ def _metadata(config_hash: str, validation_rows: dict[str, int], source_rows: di
         settings={},
         model_config={},
         dataset_config_hash=config_hash,
+        dataset_build_id="test-build",
         validation_rows=validation_rows,
         source_rows=source_rows,
         data_stream={},
@@ -902,3 +920,139 @@ def test_check_dataset_unchanged_reports_every_difference_at_once() -> None:
     assert "hash abc, the current dataset config hashes to xyz; the rows per source differ" in message
     assert "'a': checkpoint 40, now 30); the validation split differs" in message
     assert "'a': checkpoint 4, now 3" in message
+
+
+
+def test_auto_prepare_tokenizer_change_refusal_preserves_published_data(
+    tmp_path: Path, tiny_dataset_dir: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "data"
+    shutil.copytree(tiny_dataset_dir, root)
+    config = load_dataset_config(TINY_DATASET_YAML)
+    config.tokenizer.revision = "replacement"
+    path = _config_file(tmp_path, config)
+
+    def snapshot() -> dict[Path, bytes]:
+        return {
+            p.relative_to(root): p.read_bytes()
+            for directory in ("tokenizers", "sources", "processed")
+            for p in (root / directory).rglob("*") if p.is_file()
+        }
+
+    before = snapshot()
+    monkeypatch.setattr(
+        "data_preparation.lib.stages.download.write_synthetic_tokenizer", lambda _: pytest.fail("must not acquire"),
+    )
+    with pytest.raises(RuntimeError, match="auto-prepare never confirms a repair") as error:
+        resolve_dataset(_settings(path, root))
+    assert build_command(str(path), str(root)) + " --yes" in str(error.value)
+    assert snapshot() == before
+
+
+@pytest.mark.parametrize("auto_prepare", [False, True])
+def test_resolution_takes_lock_before_complete_dataset_assessment(
+    tiny_dataset_dir: Path, monkeypatch: pytest.MonkeyPatch, auto_prepare: bool
+) -> None:
+    from data_preparation.lib.build.lock import RunLocked, build_lock
+    import training.data.dataset_resolver as resolver_module
+
+    called: list[str] = []
+    monkeypatch.setattr(resolver_module, "status", lambda *a, **k: called.append("assessment"))
+    with build_lock(tiny_dataset_dir), pytest.raises(RunLocked):
+        resolve_dataset(_settings(TINY_DATASET_YAML, tiny_dataset_dir, auto_prepare=auto_prepare))
+    assert called == []
+
+
+def test_build_identity_mismatch_and_unknown_provenance_require_explicit_override(caplog: pytest.LogCaptureFixture) -> None:
+    metadata = _metadata("abc", {"a": 3, "b": 0})
+    dataset = _resolved("abc", {"a": 3, "b": 0})
+    for old in (None, "previous-build"):
+        metadata.dataset_build_id = old
+        with pytest.raises(RuntimeError, match="dataset build identity") as error:
+            check_dataset_unchanged(metadata, dataset, allow_change=False)
+        assert str(old) in str(error.value) and "test-build" in str(error.value)
+        check_dataset_unchanged(metadata, dataset, allow_change=True)
+    assert "exact dataset replay is not claimed" in caplog.text
+
+
+def _identity_rank(rank: int, root: str, rendezvous: str, connection: Any, mismatch: bool) -> None:
+    from datetime import timedelta
+    import torch.distributed as dist
+    from training.data.ownership import main_rank_phase
+    from training.data.test_ownership import _GlooBackend
+
+    try:
+        dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=10))
+        backend = _GlooBackend(rank)
+        dataset = resolve_dataset(_settings(TINY_DATASET_YAML, Path(root), auto_prepare=False), backend)
+        metadata = _metadata(dataset.config_hash, dataset.validation_rows, dataset.source_rows)
+        metadata.dataset_build_id = "replaced-build" if mismatch and rank == 1 else dataset.dataset_build_id
+        with main_rank_phase(backend, "resume identity"):
+            check_dataset_unchanged(metadata, dataset, allow_change=False)
+        connection.send(("ok", dataset.dataset_build_id))
+    except Exception as error:
+        connection.send(("error", str(error)))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        connection.close()
+
+
+@pytest.mark.slow
+@pytest.mark.timeout(45)
+@pytest.mark.parametrize("mismatch", [False, True])
+def test_gloo_ranks_agree_on_dataset_identity_or_resume_refusal(
+    tmp_path: Path, tiny_dataset_dir: Path, mismatch: bool,
+) -> None:
+    import multiprocessing as mp
+
+    context = mp.get_context("spawn")
+    connections = [context.Pipe() for _ in range(2)]
+    processes = [context.Process(target=_identity_rank, args=(rank, str(tiny_dataset_dir),
+                 (tmp_path / "rendezvous").as_uri(), pair[1], mismatch)) for rank, pair in enumerate(connections)]
+    try:
+        for process in processes:
+            process.start()
+        results = []
+        for parent, child in connections:
+            child.close()
+            assert parent.poll(30), "rank did not finish dataset identity setup"
+            results.append(parent.recv())
+        if mismatch:
+            assert all(result[0] == "error" and "replaced-build" in result[1] for result in results)
+        else:
+            assert results[0] == results[1] and results[0][0] == "ok" and results[0][1] is not None
+        for process in processes:
+            process.join(timeout=10)
+            assert process.exitcode == 0
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=5)
+        for parent, _ in connections:
+            parent.close()
+
+
+@pytest.mark.parametrize("auto_prepare", [False, True])
+def test_missing_tokenizer_payload_is_actionable_or_auto_repaired(
+    tmp_path: Path, auto_prepare: bool,
+) -> None:
+    from data_preparation.lib.build.runner import prepare
+    from training.data.tokenizer import Tokenizer
+
+    root = tmp_path / "dataset"
+    prepare(TINY_DATASET_YAML, root, assume_yes=False, num_workers=1, pass_workers=1, max_parallel_downloads=1)
+    directory = DatasetLayout(root).tokenizer_dir("synthetic")
+    payload = directory / "tokenizer.json"
+    payload.unlink()
+    settings = _settings(TINY_DATASET_YAML, root, auto_prepare=auto_prepare)
+    if auto_prepare:
+        resolved = resolve_dataset(settings)
+        assert Tokenizer(resolved.tokenizer_dir).encode("hello")
+    else:
+        with pytest.raises(RuntimeError) as error:
+            resolve_dataset(settings)
+        assert "tokenizer.json" in str(error.value)
+        assert build_command(str(TINY_DATASET_YAML), str(root)) in str(error.value)
+        assert not payload.exists()

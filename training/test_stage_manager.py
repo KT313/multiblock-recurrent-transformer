@@ -117,6 +117,24 @@ def test_warmup_and_cooldown_that_fit_are_accepted() -> None:
         sm._validate_lr_schedule()
 
 
+def test_single_stage_overlapping_warmup_and_cooldown_are_rejected() -> None:
+    # The remainder does not buy another optimizer step, and each window fits independently.
+    with pytest.raises(ValueError, match=r"warmup_steps \(8\) \+ cooldown_steps \(8\).*total optimizer steps \(10\).*not overlap"):
+        StageManager([resolved_stage("s", 10 * 1024 + 1000, 1e-3)], 1024, warmup_steps=8, cooldown_steps=8)
+
+
+@pytest.mark.parametrize("warmup,cooldown", [(4, 6), (0, 0), (0, 9), (9, 0)])
+def test_single_stage_touching_or_zero_windows_are_accepted(warmup: int, cooldown: int) -> None:
+    manager = StageManager([resolved_stage("s", 10 * 1024, 1e-3)], 1024, warmup_steps=warmup, cooldown_steps=cooldown)
+    assert (manager.total_steps, manager.warmup_steps, manager.cooldown_steps) == (10, warmup, cooldown)
+
+
+@pytest.mark.parametrize("warmup,cooldown", [(10, 0), (0, 10)])
+def test_single_stage_full_window_remains_invalid(warmup: int, cooldown: int) -> None:
+    with pytest.raises(ValueError, match="must be less than"):
+        StageManager([resolved_stage("s", 10 * 1024, 1e-3)], 1024, warmup_steps=warmup, cooldown_steps=cooldown)
+
+
 def test_a_stage_shorter_than_one_step_is_rejected() -> None:
     stages = [resolved_stage("a", tokens=8192, base_lr=3e-4), resolved_stage("b", tokens=100, base_lr=1e-4), resolved_stage("c", tokens=8192, base_lr=5e-5)]
     with pytest.raises(ValueError, match="stage 'b' is shorter than one optimizer step"):

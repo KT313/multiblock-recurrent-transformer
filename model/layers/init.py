@@ -1,19 +1,40 @@
 # Ported from seal-rg/recurrent-pretraining (Apache-2.0), commit 3055b7f; modified by Tobias Kerner 2025-2026.
 """
-Parameter initialization: the `takase` ("spike no more", Takase et al.) scheme with truncated-orthogonal weights.
+Parameter initialization: Takase scales with orthogonal weights or independent truncated-normal entries.
 
-All weights are drawn with `trunc_orthogonal_`; the standard deviations come from the takase table below. Biases are
-always zero. `Linear` is the thin `torch.nn.Linear` subclass whose `reset_parameters` applies such an init function.
+Matrix weights default to scaled orthogonal initialization. With `init_orthogonal=False`, the same scale table
+specifies the pre-truncation normal std, with bounds +/-3 std. Norm scales are one and biases zero.
+`Linear` is the thin `torch.nn.Linear` subclass whose `reset_parameters` applies such an init function.
 """
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from math import sqrt
 
 import torch
 
 # `torch.nn.init.*` return the tensor, the fused inits return None: the result is never used.
 InitFn = Callable[[torch.Tensor], object]
+MatrixInitFn = Callable[[torch.Tensor, float], None]
+
+_CHECKPOINT_INITIALIZATION: ContextVar[bool] = ContextVar("checkpoint_initialization", default=False)
+
+
+@contextmanager
+def checkpoint_initialization() -> Iterator[None]:
+    """Use cheap placeholders for weights about to be restored, without changing later reset_parameters calls.
+
+    Parameters remain allocated normally, preserving aliases and nonpersistent buffers. Embedding's own normal
+    initialization and small normalization/bias fills remain; both custom matrix initialization paths are skipped.
+    The caller must load a complete checkpoint before using the model.
+    """
+    token = _CHECKPOINT_INITIALIZATION.set(True)
+    try:
+        yield
+    finally:
+        _CHECKPOINT_INITIALIZATION.reset(token)
 
 
 @torch.no_grad()
@@ -57,11 +78,24 @@ def wrapped_trunc_ortho(tensor: torch.Tensor, std: float) -> None:
     trunc_orthogonal_(tensor, gain=std * math.sqrt(max(rows, cols)))
 
 
+def wrapped_trunc_normal(tensor: torch.Tensor, std: float) -> None:
+    """Independent normal entries, truncated at +/-3 std; std is the scale BEFORE truncation.
+
+    Restores the non-orthogonal path from the repository's former recpre/init.py. Do not use the torch default
+    bounds (-2, 2): those are absolute values, not multiples of this layer's standard deviation.
+    """
+    torch.nn.init.trunc_normal_(tensor, mean=0.0, std=std, a=-3 * std, b=3 * std)
+
+
 @torch.no_grad()
-def init_qkv(qkv_tensor: torch.Tensor, qk_std: float, v_std: float, dim: int, head_dim: int) -> None:
+def init_qkv(
+    qkv_tensor: torch.Tensor, qk_std: float, v_std: float, dim: int, head_dim: int,
+    *, init_fn: MatrixInitFn = wrapped_trunc_ortho,
+) -> None:
     """
     Initialize the fused (q, k, v) projection weight, shape (dim + 2 * kv_dim, dim), one orthogonal block per
-    component (q and k with `qk_std`, v with `v_std`). Without grouped-query attention kv_dim == dim.
+    component by default (q and k with `qk_std`, v with `v_std`); init_fn can select truncated-normal entries.
+    Without grouped-query attention kv_dim == dim.
     """
 
     total_rows = qkv_tensor.shape[0]
@@ -72,25 +106,28 @@ def init_qkv(qkv_tensor: torch.Tensor, qk_std: float, v_std: float, dim: int, he
     q_weight = qkv_tensor.new_empty([dim, dim])
     k_weight = qkv_tensor.new_empty([kv_dim, dim])
     v_weight = qkv_tensor.new_empty([kv_dim, dim])
-    wrapped_trunc_ortho(q_weight, qk_std)
-    wrapped_trunc_ortho(k_weight, qk_std)
-    wrapped_trunc_ortho(v_weight, v_std)
+    init_fn(q_weight, qk_std)
+    init_fn(k_weight, qk_std)
+    init_fn(v_weight, v_std)
     qkv_tensor.data.copy_(torch.cat([q_weight, k_weight, v_weight], dim=0).contiguous())
 
 
 @torch.no_grad()
-def init_glu(glu_tensor: torch.Tensor, w1_std: float, w2_std: float) -> None:
+def init_glu(
+    glu_tensor: torch.Tensor, w1_std: float, w2_std: float, *, init_fn: MatrixInitFn = wrapped_trunc_ortho,
+) -> None:
     """
     Initialize the fused (gate, up) projection weight of the gated MLP, shape (2 * intermediate, dim), one
-    orthogonal block per half (gate rows first with `w1_std`, then up rows with `w2_std`).
+    orthogonal block per half by default (gate rows first with `w1_std`, then up rows with `w2_std`).
+    init_fn can select truncated-normal entries with the same component scales and draw order.
     """
 
     out_features, in_features = glu_tensor.shape
     rows_per_half = out_features // 2
     gate_weight = glu_tensor.new_empty([rows_per_half, in_features])
     up_weight = glu_tensor.new_empty([rows_per_half, in_features])
-    wrapped_trunc_ortho(gate_weight, w1_std)
-    wrapped_trunc_ortho(up_weight, w2_std)
+    init_fn(gate_weight, w1_std)
+    init_fn(up_weight, w2_std)
     glu_tensor.data.copy_(torch.cat([gate_weight, up_weight], dim=0).contiguous())
 
 
@@ -103,10 +140,12 @@ class Init:
     Layer names: "embedding", "head", "normalization", "qkv", "out_attn", "glu", "out_proj", "in_proj".
     """
 
-    def __init__(self, dim: int, head_dim: int, num_layers: int) -> None:
+    def __init__(self, dim: int, head_dim: int, num_layers: int, *, orthogonal: bool = True) -> None:
         self.dim = dim
         self.head_dim = head_dim
         self.num_layers = num_layers
+        self.orthogonal = orthogonal
+        self.normal_: MatrixInitFn = wrapped_trunc_ortho if orthogonal else wrapped_trunc_normal
         std = sqrt(2 / (5 * dim))
         self.table = {
             "std": std,  # every weight not listed below
@@ -131,13 +170,13 @@ class Init:
             return torch.nn.init.ones_
         if name_of_layer == "qkv":
             std = self._std("std")
-            return lambda tensor: init_qkv(tensor, std, std, self.dim, self.head_dim)
+            return lambda tensor: init_qkv(tensor, std, std, self.dim, self.head_dim, init_fn=self.normal_)
         if name_of_layer == "glu":
             # Upstream passes the w1 std for both halves; kept for numerical identity.
             std = self._std("std")
-            return lambda tensor: init_glu(tensor, std, std)
+            return lambda tensor: init_glu(tensor, std, std, init_fn=self.normal_)
         std = self._std(name_of_layer)
-        return lambda tensor: wrapped_trunc_ortho(tensor, std=std)
+        return lambda tensor: self.normal_(tensor, std)
 
     def apply(self, module: torch.nn.Module, name_of_layer: str) -> None:
         """
@@ -146,7 +185,10 @@ class Init:
 
         weight = getattr(module, "weight", None)
         if weight is not None:
-            self.fn(name_of_layer)(weight)
+            if _CHECKPOINT_INITIALIZATION.get() and name_of_layer != "normalization":
+                torch.nn.init.zeros_(weight)
+            else:
+                self.fn(name_of_layer)(weight)
         bias = getattr(module, "bias", None)
         if bias is not None:
             torch.nn.init.zeros_(bias)
@@ -160,7 +202,8 @@ class Init:
         return float(self.table["embed_scale"])
 
     def __repr__(self) -> str:
-        return f"takase Initializer {self.dim}x{self.head_dim}-{self.num_layers}"
+        suffix = "" if self.orthogonal else " (truncated normal, +/-3 std)"
+        return f"takase Initializer {self.dim}x{self.head_dim}-{self.num_layers}{suffix}"
 
 
 class Linear(torch.nn.Linear):
@@ -174,6 +217,9 @@ class Linear(torch.nn.Linear):
 
     @torch.no_grad()
     def reset_parameters(self) -> None:
-        self.init_method(self.weight)
+        if _CHECKPOINT_INITIALIZATION.get():
+            self.weight.zero_()
+        else:
+            self.init_method(self.weight)
         if self.bias is not None:
             self.bias.data.zero_()
