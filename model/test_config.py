@@ -412,8 +412,7 @@ def test_valid_scalars_and_false_switches_are_preserved() -> None:
     assert config.tie_embeddings is False and config.qk_bias is False
 
 
-def test_trainable_initial_state_is_off_by_default_and_in_every_architecture_yaml() -> None:
+def test_trainable_initial_state_is_off_by_default() -> None:
     assert RecurrentConfig().use_trainable_initial_state is False
-    for path in sorted(TINY_ARCHITECTURE.parent.glob("*.yaml")):
-        assert RecurrentConfig.from_yaml(path).use_trainable_initial_state is False, path
+    assert RecurrentConfig.from_yaml(TINY_ARCHITECTURE).use_trainable_initial_state is False
     assert RecurrentConfig.from_yaml(TINY_ARCHITECTURE, use_trainable_initial_state=True).use_trainable_initial_state

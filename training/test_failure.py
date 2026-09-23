@@ -68,7 +68,7 @@ def _identity(pid: int) -> str | None:
     try:
         fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
         return None if fields[0] == 'Z' else fields[19]  # Linux starttime; avoid matching a reused PID
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):  # the process exited between the listing and the read (ESRCH)
         return None
 
 
@@ -80,7 +80,7 @@ def _descendants(pid: int, known: dict[int, str]) -> None:
     try:
         children = {int(child) for task in Path(f'/proc/{pid}/task').iterdir()
                     for child in (task / 'children').read_text().split()}
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return
     for child in children:
         _descendants(child, known)

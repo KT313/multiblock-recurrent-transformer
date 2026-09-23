@@ -1093,16 +1093,18 @@ def test_trainable_initial_state_off_adds_no_parameter_and_draws_the_same_init()
 
 def test_trainable_initial_state_is_one_standard_normal_vector_per_block_drawn_after_the_other_weights() -> None:
     plain = seeded_tiny()
+    # The learned states must consume the next standard-normal draws after ordinary weight initialization.
+    generator = torch.Generator().set_state(torch.get_rng_state())
     learned = seeded_tiny(use_trainable_initial_state=True)
     for name, tensor in plain.state_dict().items():
         assert torch.equal(tensor, learned.state_dict()[name]), name  # the init draws before it are untouched
     states = learned.transformer.initial_states
     assert len(states) == len(learned.transformer.core_blocks)
     assert all(state.shape == (learned.config.n_embd,) and state.requires_grad for state in states)
-    wide = build_model(TINY_ARCHITECTURE, use_custom_kernels=False, use_trainable_initial_state=True, n_embd=4096,
-                       num_attention_heads=4, intermediate_size=8)
-    state = wide.transformer.initial_states[0].detach()
-    assert abs(state.mean().item()) < 0.1 and abs(state.std().item() - 1) < 0.1
+    for state in states:
+        expected = torch.randn(learned.config.n_embd, generator=generator, dtype=state.dtype)
+        torch.testing.assert_close(state, expected, rtol=0, atol=0)
+    assert torch.equal(torch.get_rng_state(), generator.get_state())
 
 
 def test_trainable_initial_state_replaces_the_noise_in_the_forward(monkeypatch: pytest.MonkeyPatch) -> None:
