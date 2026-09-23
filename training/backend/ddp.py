@@ -85,11 +85,16 @@ class DDPBackend(SingleDeviceBackend):
         here), then compile when asked: compile OUTSIDE the DDP wrapper, the order PyTorch recommends (its DDP
         optimizer splits the graph at the bucket boundaries so the gradient all-reduce overlaps the backward).
         `wrappers` records the layering for `plain_model`.
+
+        A trainable initial state (`use_trainable_initial_state`) enters only the first recurrence iteration, so it
+        gets no gradient on a micro-batch whose sampled depth starts with no-grad iterations; DDP then has to look
+        for unused parameters. Every rank draws the same depth, so the ranks agree on which parameters those are.
         """
 
         model = model.to(self.device)
         device_ids = [self.device.index] if self.device.type == "cuda" else None
-        wrapped: Module = DistributedDataParallel(model, device_ids=device_ids)
+        find_unused = bool(getattr(getattr(model, "config", None), "use_trainable_initial_state", False))
+        wrapped: Module = DistributedDataParallel(model, device_ids=device_ids, find_unused_parameters=find_unused)
         if compile_model:
             wrapped = compile_module(wrapped)
         self.wrappers = ("compile", "ddp") if compile_model else ("ddp",)

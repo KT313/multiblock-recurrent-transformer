@@ -90,6 +90,7 @@ def decode_generated_sample(
 def save_generated_samples(
     samples: list[GeneratedSample], out_path: Path, *, step: int, max_new_tokens: int,
     seed: int, batch_size: int, use_cache: bool, execution_policy: ExecutionPolicy | None,
+    trainable_initial_state: bool = False,
 ) -> None:
     decoding: dict[str, float | str | int | None] = {
         "max_new_tokens": max_new_tokens, "seed": seed, "batch_size": batch_size,
@@ -97,6 +98,8 @@ def save_generated_samples(
         "latent_rng": "per_core_token_columns_v1" if use_cache else "global_prefix_v1",
         "logits_to_keep": 1 if use_cache else 0,
     }
+    if trainable_initial_state:  # the model's learned initial state replaces the latent noise on both paths
+        decoding.update(latent_policy="trainable_initial_state", latent_rng=None)
     if execution_policy is not None:
         decoding["execution_precision"] = execution_policy.precision
     out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -867,3 +867,22 @@ def test_hf_invalid_depth_precedes_recurrence(monkeypatch: pytest.MonkeyPatch, s
     monkeypatch.setattr(model.model, "run_core_blocks", forbidden)
     with pytest.raises(ValueError, match="num_steps"):
         model(ids(1, 2), num_steps=steps)
+
+
+def test_export_keeps_the_trainable_initial_state(tmp_path: Path) -> None:
+    torch.manual_seed(0)
+    model = build_model(TINY_ARCHITECTURE, use_custom_kernels=False, use_trainable_initial_state=True).eval()
+    with torch.no_grad():  # a state unlike a fresh init, so a reinitialised load would show
+        for state in model.transformer.initial_states:
+            state.mul_(3)
+    out_dir = export_to_hf(model, model.config, tmp_path / "export", eos_token_id=2)
+    loaded = load_exported(out_dir).train(False)
+    assert loaded.config.use_trainable_initial_state is True
+    for exported, original in zip(loaded.model.transformer.initial_states, model.transformer.initial_states):
+        assert torch.equal(exported, original)
+    x = ids()
+    with torch.no_grad():
+        expected = model(x, return_logits=True)["logits"]
+        actual = loaded(x).logits
+    assert expected is not None
+    torch.testing.assert_close(actual, expected)

@@ -5,6 +5,7 @@ Tests for the parameter-group split, `build_optimizer`/`set_lr` and hand-checked
 
 import copy
 import math
+from dataclasses import replace
 from typing import Any, Callable
 
 import pytest
@@ -50,6 +51,13 @@ def test_no_wd_group_is_exactly_bias_and_norm_params(tiny_model: RecurrentGPT) -
     # every no-WD parameter is 1-D or a qk_bias tensor; every WD parameter is a matrix
     assert all(p.ndim == 1 or p.shape[0] == 2 for p in groups[2]["params"])
     assert all(p.ndim == 2 for p in groups[0]["params"] + groups[1]["params"])
+
+
+def test_trainable_initial_states_join_the_no_wd_group(tiny_model: RecurrentGPT) -> None:
+    model = RecurrentGPT(replace(tiny_model.config, use_trainable_initial_state=True))
+    groups = get_param_groups(model, weight_decay=0.1, no_wd_for_bias_and_norm=True)
+    no_wd = {id(p) for p in groups[2]["params"]}
+    assert {id(p) for p in model.transformer.initial_states} <= no_wd and groups[2]["weight_decay"] == 0.0
 
 
 def test_embedding_group_holds_wte_only(tiny_model: RecurrentGPT) -> None:

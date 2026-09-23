@@ -103,7 +103,8 @@ def generate_distributed_samples(
         check_payload(samples)
         if backend.is_main:
             save_generated_samples(samples, out_path, step=step, max_new_tokens=max_new_tokens,
-                                   seed=0, batch_size=batch_size, use_cache=use_cache, execution_policy=backend.execution_policy)
+                                   seed=0, batch_size=batch_size, use_cache=use_cache, execution_policy=backend.execution_policy,
+                                   trainable_initial_state=model.config.use_trainable_initial_state)
         finish_publication(backend)
         poll_stop(stop, "after sample publication")
         return SamplePhaseResult(True, samples, counts)

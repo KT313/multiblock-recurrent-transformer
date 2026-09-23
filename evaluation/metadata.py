@@ -68,6 +68,7 @@ def benchmark_execution_metadata(
     autocast_enabled = torch.is_autocast_enabled(session.device.type)
     config = results.get("config", {})
     reported_batches = config.get("batch_sizes") if isinstance(config, Mapping) else None
+    trainable_initial_state = bool(getattr(getattr(session.model, "config", None), "use_trainable_initial_state", False))
     return {
         "batching": {
             "requested": batch_size,
@@ -103,6 +104,7 @@ def benchmark_execution_metadata(
             "effective_per_request_use_cache": {"value": None, "source": "unavailable"},
             "policy_when_use_cache_true": "persistent_per_token_core_latents; separate_kv_per_recurrence_occurrence",
             "policy_when_use_cache_false": "legacy_full_prefix_latent_resampling; no_kv_cache",
+            "initial_latent": "trainable_initial_state" if trainable_initial_state else "normal_noise",
             "observation_scope": "wrapper_defaults_only; harness_or_task_generation_overrides_are_not_observed",
         },
     }

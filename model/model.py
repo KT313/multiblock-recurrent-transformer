@@ -129,6 +129,7 @@ class TransformerModules(torch.nn.ModuleDict):
     coda: torch.nn.ModuleList  # SandwichBlocks run once after the recurrence
     ln_fs: torch.nn.ModuleList  # one LayerNorm per core block, applied to the block input
     ln_final: torch.nn.LayerNorm
+    initial_states: torch.nn.ParameterList  # one (n_embd,) state per core block; only with `use_trainable_initial_state`
 
 
 class RecurrentGPT(torch.nn.Module):
@@ -196,6 +197,12 @@ class RecurrentGPT(torch.nn.Module):
                 ln_final=ln_final,
             )
         )
+        # Absent without the flag, so the state dict and the init RNG order stay those of the noise-initialised model.
+        if config.use_trainable_initial_state:
+            initial_states = torch.nn.ParameterList()
+            for _ in n_layers_per_block:
+                initial_states.append(torch.nn.Parameter(torch.empty(config.n_embd)))
+            self.transformer["initial_states"] = initial_states
         self.emb_scale = config.init.embedding_scale
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False, init_method=config.init.fn("head"))
         if config.tie_embeddings:
@@ -235,13 +242,28 @@ class RecurrentGPT(torch.nn.Module):
 
     def reset_parameters(self) -> None:
         """
-        Re-initialize the modules that are not `Linear` (those init themselves): embedding and LayerNorms.
+        Re-initialize the modules that are not `Linear` (those init themselves): embedding and LayerNorms, and last
+        the trainable initial states (standard normal, the distribution of the noise they replace), if any.
         """
 
         self.config.init.apply(self.transformer.wte, "embedding")
         for ln_f in self.transformer.ln_fs:
             self.config.init.apply(ln_f, "normalization")
         self.config.init.apply(self.transformer.ln_final, "normalization")
+        if self.config.use_trainable_initial_state:
+            for initial_state in self.transformer.initial_states:
+                torch.nn.init.normal_(initial_state, mean=0.0, std=1.0)
+
+    def initial_latent(self, block_idx: int, x: Tensor) -> Tensor:
+        """
+        The latent state core block `block_idx` starts from, shaped like its input `x` `(B, S, E)`: the learned
+        `(E,)` vector expanded over batch and positions with `use_trainable_initial_state`, else standard-normal
+        noise from the global RNG (`initialize_state`).
+        """
+
+        if self.config.use_trainable_initial_state:
+            return cast(Tensor, self.transformer.initial_states[block_idx]).to(x.dtype).expand_as(x)
+        return initialize_state(x)
 
     def forward(
         self,
@@ -393,7 +415,8 @@ class RecurrentGPT(torch.nn.Module):
                 x = block(x, rotary, mask, cache)
             for core, count in enumerate(steps):
                 x_base = self.transformer.ln_fs[core](x)
-                latent = state.latent(core, x, start)
+                # the learned state is the same for every token, so prefill and incremental decoding agree as well
+                latent = self.initial_latent(core, x) if self.config.use_trainable_initial_state else state.latent(core, x, start)
                 if self.core_bf16_stream and torch.is_autocast_enabled(x.device.type):
                     latent = latent.to(torch.get_autocast_dtype(x.device.type))
                 adapter = self.transformer.adapters[core]
@@ -538,14 +561,16 @@ class RecurrentGPT(torch.nn.Module):
         self, x: Tensor, freqs_cis: Tensor, mask: AttentionMask, num_steps: StepsPair | None, block_idx: int
     ) -> Tensor:
         """
-        Core block `block_idx` on `x`: normalise the input (`ln_fs`), draw the random latent state, project the
-        normalised input through its half of the adapter once, then iterate the block n times without and k times
-        with gradient (`num_steps`, or the sampler's draw when None).
+        Core block `block_idx` on `x`: normalise the input (`ln_fs`), take the initial latent state (random noise,
+        or the learned state with `use_trainable_initial_state`; `initial_latent`), project the normalised input
+        through its half of the adapter once, then iterate the block n times without and k times with gradient
+        (`num_steps`, or the sampler's draw when None).
         """
 
         transformer = self.transformer
         x_base = transformer.ln_fs[block_idx](x)
-        x_latent = initialize_state(x)  # consumes the global RNG first, then (if sampling) the sampler's draw
+        # noise consumes the global RNG first, then (if sampling) the sampler's draw; the learned state draws nothing
+        x_latent = self.initial_latent(block_idx, x)
         if self.core_bf16_stream and torch.is_autocast_enabled(x.device.type):
             # The bf16 stream: the latent enters the first iteration in the dtype every later iteration has. The
             # adapter GEMM would cast it to this dtype anyway, so the values are the same; what it avoids is a second

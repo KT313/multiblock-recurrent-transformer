@@ -1083,3 +1083,49 @@ def test_compile_smoke_bf16_residual_stream() -> None:
         out = compiled(x, labels=x)
     out["loss"].backward()
     assert torch.isfinite(out["loss"]) and all(p.grad is not None for p in model.parameters())
+
+
+def test_trainable_initial_state_off_adds_no_parameter_and_draws_the_same_init() -> None:
+    plain = seeded_tiny()
+    assert "initial_states" not in plain.transformer
+    assert not any("initial_state" in name for name, _ in plain.named_parameters())
+
+
+def test_trainable_initial_state_is_one_standard_normal_vector_per_block_drawn_after_the_other_weights() -> None:
+    plain = seeded_tiny()
+    learned = seeded_tiny(use_trainable_initial_state=True)
+    for name, tensor in plain.state_dict().items():
+        assert torch.equal(tensor, learned.state_dict()[name]), name  # the init draws before it are untouched
+    states = learned.transformer.initial_states
+    assert len(states) == len(learned.transformer.core_blocks)
+    assert all(state.shape == (learned.config.n_embd,) and state.requires_grad for state in states)
+    wide = build_model(TINY_ARCHITECTURE, use_custom_kernels=False, use_trainable_initial_state=True, n_embd=4096,
+                       num_attention_heads=4, intermediate_size=8)
+    state = wide.transformer.initial_states[0].detach()
+    assert abs(state.mean().item()) < 0.1 and abs(state.std().item() - 1) < 0.1
+
+
+def test_trainable_initial_state_replaces_the_noise_in_the_forward(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = seeded_tiny(use_trainable_initial_state=True)
+
+    def fail(x: Tensor) -> Tensor:
+        raise AssertionError("the noise must not be drawn")
+
+    monkeypatch.setattr(model_module, "initialize_state", fail)
+    x = torch.randn(2, 5, model.config.n_embd)
+    torch.testing.assert_close(model.initial_latent(1, x), model.transformer.initial_states[1].expand(2, 5, -1))
+    model.eval()
+    first = model(ids(), return_logits=True)["logits"]
+    second = model(ids(), return_logits=True)["logits"]  # no seeding: nothing random is left in eval
+    assert first is not None and second is not None and torch.equal(first, second)
+
+
+def test_trainable_initial_state_gets_gradient_only_without_no_grad_iterations() -> None:
+    model = seeded_tiny(use_trainable_initial_state=True).train()
+    tokens = ids()
+    model(tokens, labels=tokens, num_steps=(0, 2))["loss"].backward()
+    grads = [state.grad for state in model.transformer.initial_states]
+    assert all(grad is not None and torch.count_nonzero(grad) > 0 for grad in grads)
+    model.zero_grad(set_to_none=True)
+    model(tokens, labels=tokens, num_steps=(1, 1))["loss"].backward()
+    assert all(state.grad is None for state in model.transformer.initial_states)

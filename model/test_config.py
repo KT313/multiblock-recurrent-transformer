@@ -366,7 +366,7 @@ def test_bf16_residual_stream_default_is_off_in_every_architecture_yaml() -> Non
         assert RecurrentConfig.from_yaml(path).bf16_residual_stream == "none", path
 
 
-@pytest.mark.parametrize("field", ["tie_embeddings", "qk_bias", "use_custom_kernels", "init_orthogonal"])
+@pytest.mark.parametrize("field", ["tie_embeddings", "qk_bias", "use_custom_kernels", "init_orthogonal", "use_trainable_initial_state"])
 @pytest.mark.parametrize("invalid", ["false", "true", 0, 1, None])
 @pytest.mark.parametrize("source", ["direct", "yaml", "json", "override"])
 def test_architecture_switches_require_booleans(tmp_path: Path, field: str, invalid: Any, source: str) -> None:
@@ -410,3 +410,10 @@ def test_valid_scalars_and_false_switches_are_preserved() -> None:
     assert config.norm_eps == 1 and isinstance(config.norm_eps, int)
     assert config.rope_settings.rope_base == 12.5
     assert config.tie_embeddings is False and config.qk_bias is False
+
+
+def test_trainable_initial_state_is_off_by_default_and_in_every_architecture_yaml() -> None:
+    assert RecurrentConfig().use_trainable_initial_state is False
+    for path in sorted(TINY_ARCHITECTURE.parent.glob("*.yaml")):
+        assert RecurrentConfig.from_yaml(path).use_trainable_initial_state is False, path
+    assert RecurrentConfig.from_yaml(TINY_ARCHITECTURE, use_trainable_initial_state=True).use_trainable_initial_state

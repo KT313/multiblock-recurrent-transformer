@@ -149,5 +149,6 @@ def generate_and_save_samples(
     save_generated_samples(
         samples, out_path, step=step, max_new_tokens=max_new_tokens,
         seed=seed, batch_size=batch_size, use_cache=use_cache, execution_policy=execution_policy,
+        trainable_initial_state=model.config.use_trainable_initial_state,
     )
     return samples
