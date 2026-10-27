@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from evaluation.benchmark_helpers import (
-    build_benchmark_harness, check_benchmark_requests, flatten_results, import_lm_eval,
+    build_benchmark_harness, check_benchmark_requests, code_execution_allowed, flatten_results, import_lm_eval,
     run_benchmark_harness, save_benchmark_results,
 )
 from evaluation.distributed import EvaluationCancelled, agree_on_phase, exchange, finish_publication, poll_stop
@@ -98,6 +98,7 @@ def evaluate_distributed_benchmarks(
                             context_cap=model.config.model_max_sequence_length, custom_kernels=model.config.use_custom_kernels,
                         )
                         metadata[label].update(tokenizer_contract=tokenizer.contract, apply_chat_template=apply_chat_template,
+                                               confirm_run_unsafe_code=code_execution_allowed(),
                                                evaluator_world_size=1, inference_world_size=backend.world_size,
                                                protocol=PROTOCOL, target_requests=TARGET_REQUESTS, serial_bootstrap=True,
                                                plan_digest=executor.plan_digest, group_subtasks=results.get("group_subtasks", {}),

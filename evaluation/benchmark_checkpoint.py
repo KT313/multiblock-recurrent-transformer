@@ -15,11 +15,14 @@ import logging
 import sys
 from pathlib import Path
 
+# drop this folder from the import path: its evaluate.py would shadow the `evaluate` package that lm-eval's code
+# tasks (humaneval, mbpp) import
+sys.path[:] = [entry for entry in sys.path if Path(entry or ".").resolve() != Path(__file__).resolve().parent]
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from evaluation.cli.benchmark_checkpoint import parse_benchmark_settings, run_checkpoint_benchmark_check
-from training.cli import configure_console_logging, get_launch_rank, select_fatal_error_handler, stop_on_interrupt
-from training.failure import fatal_errors
+from evaluation.cli.benchmark_checkpoint import parse_benchmark_settings, run_checkpoint_benchmark_check  # noqa: E402
+from training.cli import configure_console_logging, get_launch_rank, select_fatal_error_handler, stop_on_interrupt  # noqa: E402
+from training.failure import fatal_errors  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:

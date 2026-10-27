@@ -24,6 +24,7 @@ from evaluation.benchmark_helpers import (
     TASK_DEFAULT_FEWSHOT,
     build_benchmark_harness,
     check_benchmark_requests,
+    code_execution_allowed,
     flatten_results,
     import_lm_eval as _import_lm_eval,
     run_benchmark_harness,
@@ -110,6 +111,7 @@ def evaluate_on_benchmarks(
         if out_path is not None:
             execution_settings[recurrence_label(recurrence)]["tokenizer_contract"] = tokenizer.contract
             execution_settings[recurrence_label(recurrence)]["apply_chat_template"] = apply_chat_template
+            execution_settings[recurrence_label(recurrence)]["confirm_run_unsafe_code"] = code_execution_allowed()
         label = recurrence_label(recurrence)
         metrics |= flatten_results(results["results"], label)
         raw_results[label] = results["results"]

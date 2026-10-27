@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import json
+import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -32,6 +33,16 @@ HARNESS_RANDOM_SEED = 0  # preserve lm-eval defaults, independently of the model
 HARNESS_NUMPY_SEED = 1234
 HARNESS_FEWSHOT_SEED = 1234
 BOOTSTRAP_ITERS = 100  # lm-eval's stderr resampling; its default of 100000 is the slowest part of a small run
+CODE_EXECUTION_ENV = "HF_ALLOW_CODE_EVAL"  # "1" lets tasks that execute generated code run (humaneval, mbpp)
+
+
+def code_execution_allowed() -> bool:
+    """
+    Whether tasks marked unsafe_code may run. The same variable unlocks the `code_eval` metric those tasks score
+    with, so one switch covers both; it is not a Settings field because it does not change any score.
+    """
+
+    return os.environ.get(CODE_EXECUTION_ENV) == "1"
 
 
 def check_benchmark_requests(
@@ -88,6 +99,7 @@ def run_benchmark_harness(
             random_seed=HARNESS_RANDOM_SEED, numpy_random_seed=HARNESS_NUMPY_SEED,
             torch_random_seed=None, fewshot_random_seed=HARNESS_FEWSHOT_SEED, bootstrap_iters=BOOTSTRAP_ITERS,
             fewshot_as_multiturn=True, use_cache=None, cache_requests=False,
+            confirm_run_unsafe_code=code_execution_allowed(),
             **({"apply_chat_template": True} if apply_chat_template else {}),
         )
     check_benchmark_results(results)

@@ -15,6 +15,9 @@ from typing import Any
 
 import pytest
 
+# loaded with the real lm_eval before any test swaps `sys.modules["lm_eval"]` for a stub or None, so no test
+# depends on an earlier one having imported it
+import evaluation.benchmark_model  # noqa: F401
 from evaluation.benchmarks import (
     BOOTSTRAP_ITERS,
     DEFAULT_TASKS,
@@ -40,7 +43,6 @@ def stub_lm_eval(monkeypatch: pytest.MonkeyPatch, error: Exception | None = None
     A fake `lm_eval` package in `sys.modules` recording the `HFLM` and `simple_evaluate` arguments.
     """
 
-    import evaluation.benchmark_model  # noqa: F401
     import torch
 
     calls: dict[str, Any] = {}
@@ -136,6 +138,28 @@ def test_num_fewshot_default_leaves_every_task_at_its_own(
     assert calls["evaluate"].get("num_fewshot") == 0
     with pytest.raises(ValueError, match="num_fewshot must be >= -1"):
         evaluate_on_benchmarks(tiny_model, tokenizer, ["arc_easy"], num_fewshot=-2)
+
+
+def test_code_execution_is_opt_in_through_the_environment(
+    tiny_model: RecurrentGPT, tiny_tokenizer_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Tasks that execute generated code (humaneval, mbpp) run only with HF_ALLOW_CODE_EVAL=1, the variable lm-eval's
+    code_eval metric already requires; the saved metadata records which way it was.
+    """
+
+    calls = stub_lm_eval(monkeypatch)
+    tokenizer = Tokenizer(tiny_tokenizer_dir)
+    monkeypatch.delenv("HF_ALLOW_CODE_EVAL", raising=False)
+    evaluate_on_benchmarks(tiny_model, tokenizer, ["arc_easy"])
+    refused = calls["evaluate"]["confirm_run_unsafe_code"]
+    assert refused is False
+    monkeypatch.setenv("HF_ALLOW_CODE_EVAL", "1")
+    path = benchmarks_path(tmp_path, 3)
+    evaluate_on_benchmarks(tiny_model, tokenizer, ["arc_easy"], out_path=path, step=3)
+    assert calls["evaluate"]["confirm_run_unsafe_code"] is True
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert record["execution_metadata"]["recurrences"]["mean"]["confirm_run_unsafe_code"] is True
 
 
 def test_default_tasks_are_the_settings_default() -> None:
