@@ -53,6 +53,8 @@ The command loads model weights on each rank but creates no optimizer, data load
 
 Results use the normal benchmark JSON schema and are saved in a fresh `<out_dir>/<run_name>/benchmark_checks/step-XXXXXXXX-*/step-XXXXXXXX.json`. Existing scheduled results and training logs are preserved. `--output_dir` chooses a new directory, which must not already exist. Ctrl-C/SIGTERM requests a stop at the next shared benchmark boundary; incomplete work publishes no results. Fatal failures under torchrun use the same worker-exit policy as training. This verifies checkpoint inference, not resuming an optimizer or a complete training step. Benchmark datasets still need network access or an existing local cache.
 
+`--samples file.json` evaluates only listed examples: `{"samples": {"<leaf task>": [doc index, ...]}}`, leaf tasks as lm-eval names them (`mmlu_anatomy`, `anli_r1`) and indices into their evaluation documents. `evaluation/contamination_check.py` writes such files (`clean_samples.json`: the examples not found in the training data; `contaminated_samples.json`: the others). Every leaf task of the run must be listed and every index must exist, checked before the model loads, so no task silently runs its full test set; `--benchmark_limit` cannot be combined with it. The result JSON records the file, its sha256 and the counts under `samples`.
+
 Tasks that execute generated code (`humaneval`, `mbpp`) run only with `HF_ALLOW_CODE_EVAL=1` in the environment. lm-eval's `code_eval` metric requires the same variable, and the harness then passes `confirm_run_unsafe_code=True`. The code runs on the evaluating node under the metric's timeouts. The result metadata records the setting as `confirm_run_unsafe_code`.
 
 ## Testing

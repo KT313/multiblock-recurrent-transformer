@@ -351,3 +351,65 @@ def test_dependency_metadata_does_not_import_optional_packages(monkeypatch: pyte
     assert dependencies["triton"] == {"version": None, "status": "not_loaded"}
     assert dependencies["lm_eval"] == {"version": None, "status": "not_loaded"}
     assert "triton" not in sys.modules and "lm_eval" not in sys.modules
+
+
+def write_selection(path: Path, samples: Any) -> Path:
+    path.write_text(json.dumps({"criterion": {"flag_share": 0.5}, "samples": samples}), encoding="utf-8")
+    return path
+
+
+def test_sample_selection_rejects_malformed_lists(tmp_path: Path) -> None:
+    from evaluation.benchmark_helpers import load_benchmark_samples
+
+    selection = load_benchmark_samples(write_selection(tmp_path / "ok.json", {"mmlu_anatomy": [3, 0], "gsm8k": [1]}))
+    assert selection.indices == {"mmlu_anatomy": [0, 3], "gsm8k": [1]} and len(selection.digest) == 64
+    assert selection.record()["counts"] == {"gsm8k": 1, "mmlu_anatomy": 2}
+    malformed: list[dict[str, Any]] = [{}, {"gsm8k": []}, {"gsm8k": [1, 1]}, {"gsm8k": [-1]}, {"gsm8k": ["1"]}]
+    for bad in malformed:
+        with pytest.raises(ValueError):
+            load_benchmark_samples(write_selection(tmp_path / "bad.json", bad))
+
+
+def test_sample_selection_must_cover_every_leaf_task(tmp_path: Path) -> None:
+    """
+    A leaf task missing from the file would silently run in full, an index past its end would fail late: both stop
+    the run before the model loads.
+    """
+
+    from evaluation.benchmark_helpers import check_samples_cover, load_benchmark_samples
+
+    selection = load_benchmark_samples(write_selection(tmp_path / "s.json", {"anli_r1": [0, 5], "other": [0]}))
+    check_samples_cover(selection, {"anli_r1": 10})  # tasks of the file outside the run are fine
+    with pytest.raises(ValueError, match=r"does not list \['anli_r2'\]"):
+        check_samples_cover(selection, {"anli_r1": 10, "anli_r2": 10})
+    with pytest.raises(ValueError, match="lists anli_r1 documents \\[5\\] but the task has 5"):
+        check_samples_cover(selection, {"anli_r1": 5})
+
+
+def test_sample_selection_reaches_the_harness_and_the_record(tmp_path: Path) -> None:
+    from evaluation.benchmark_helpers import load_benchmark_samples, run_benchmark_harness, save_benchmark_results
+
+    selection = load_benchmark_samples(write_selection(tmp_path / "s.json", {"arc_easy": [0, 2]}))
+    calls: dict[str, Any] = {}
+
+    def simple_evaluate(**kwargs: Any) -> dict[str, Any]:
+        calls.update(kwargs)
+        return {"results": RESULTS}
+
+    harness = types.SimpleNamespace(simple_evaluate=simple_evaluate)
+    run_benchmark_harness(harness, object(), ["arc_easy"], None, -1, samples=selection)
+    assert calls["samples"] == {"arc_easy": [0, 2]}
+    calls.clear()
+    run_benchmark_harness(harness, object(), ["arc_easy"], None, -1)
+    assert "samples" not in calls  # no selection: lm-eval's own default, every example
+    with pytest.raises(ValueError, match="cannot be combined"):
+        run_benchmark_harness(harness, object(), ["arc_easy"], 10, -1, samples=selection)
+
+    path = tmp_path / "result.json"
+    save_benchmark_results(
+        path, step=1, tasks=["arc_easy"], num_fewshot=-1, limit=None, seed=0, recurrences=[None], metrics={},
+        raw_results={}, versions={}, n_shot={}, execution_settings={}, custom_kernels=False, execution_policy=None,
+        samples=selection,
+    )
+    record = json.loads(path.read_text(encoding="utf-8"))["samples"]
+    assert record["counts"] == {"arc_easy": 2} and record["digest"] == selection.digest

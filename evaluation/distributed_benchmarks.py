@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from evaluation.benchmark_helpers import (
-    build_benchmark_harness, check_benchmark_requests, code_execution_allowed, flatten_results, import_lm_eval,
+    BenchmarkSamples, build_benchmark_harness, check_benchmark_requests, code_execution_allowed, flatten_results, import_lm_eval,
     run_benchmark_harness, save_benchmark_results,
 )
 from evaluation.distributed import EvaluationCancelled, agree_on_phase, exchange, finish_publication, poll_stop
@@ -30,7 +30,7 @@ class BenchmarkPhaseResult:
 
 def evaluate_configured_benchmarks(
     backend: Backend, model: RecurrentGPT, tokenizer: Tokenizer, settings: Settings, *, out_path: Path,
-    step: int, stop: StopController, on_fatal_error: FatalHandler | None = None,
+    step: int, stop: StopController, on_fatal_error: FatalHandler | None = None, samples: BenchmarkSamples | None = None,
 ) -> BenchmarkPhaseResult:
     """Keep scheduled training and checkpoint checks on exactly the same inference settings and path."""
     return evaluate_distributed_benchmarks(
@@ -38,7 +38,7 @@ def evaluate_configured_benchmarks(
         recurrences=settings.benchmark_recurrences or [None], out_path=out_path, step=step, seed=settings.seed,
         batch_size=settings.benchmark_batch_size, limit=settings.benchmark_limit,
         num_fewshot=settings.benchmark_num_fewshot, apply_chat_template=settings.benchmark_apply_chat_template,
-        on_fatal_error=on_fatal_error,
+        on_fatal_error=on_fatal_error, samples=samples,
     )
 
 
@@ -46,7 +46,7 @@ def evaluate_distributed_benchmarks(
     backend: Backend, model: RecurrentGPT, tokenizer: Tokenizer, tasks: Sequence[str], *, stop: StopController,
     recurrences: Sequence[Recurrence], out_path: Path, step: int, seed: int = 0, batch_size: int = 8,
     limit: int | None = None, num_fewshot: int = -1, apply_chat_template: bool = False,
-    on_fatal_error: FatalHandler | None = None,
+    on_fatal_error: FatalHandler | None = None, samples: BenchmarkSamples | None = None,
 ) -> BenchmarkPhaseResult:
     with fatal_errors(on_fatal_error):
         check_benchmark_requests(model, tasks, recurrences, num_fewshot)
@@ -55,6 +55,7 @@ def evaluate_distributed_benchmarks(
         agree_on_phase(backend, model, tokenizer, {
             "phase": "benchmarks", "step": step, "tasks": tasks, "recurrences": recurrences, "seed": seed,
             "batch_size": batch_size, "limit": limit, "num_fewshot": num_fewshot, "chat": apply_chat_template,
+            "samples": None if samples is None else samples.digest,
         })
         if poll_stop(stop, "before benchmark jobs"):
             return BenchmarkPhaseResult(False, {})
@@ -84,7 +85,7 @@ def evaluate_distributed_benchmarks(
                 if backend.is_main:
                     controller = BenchmarkController(executor)
                     try:
-                        results = run_benchmark_harness(lm_eval, controller, tasks, limit, num_fewshot, apply_chat_template)
+                        results = run_benchmark_harness(lm_eval, controller, tasks, limit, num_fewshot, apply_chat_template, samples)
                     except EvaluationCancelled:
                         cancelled = True
                     else:
@@ -124,7 +125,7 @@ def evaluate_distributed_benchmarks(
             save_benchmark_results(
                 out_path, step=step, tasks=tasks, num_fewshot=num_fewshot, limit=limit, seed=seed, recurrences=recurrences,
                 metrics=metrics, raw_results=raw, versions=versions, n_shot=shots, execution_settings=metadata,
-                custom_kernels=model.config.use_custom_kernels, execution_policy=backend.execution_policy,
+                custom_kernels=model.config.use_custom_kernels, execution_policy=backend.execution_policy, samples=samples,
             )
         finish_publication(backend)
         poll_stop(stop, "after benchmark publication")

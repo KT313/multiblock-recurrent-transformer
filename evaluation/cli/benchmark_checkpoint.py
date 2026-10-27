@@ -12,6 +12,7 @@ from jsonargparse import ActionConfigFile, ArgumentParser  # type: ignore[attr-d
 from data_preparation import DatasetLayout, load_dataset_config
 from data_preparation.lib.abort import StopCheck
 from data_preparation.lib.log import get_logger
+from evaluation.benchmark_helpers import benchmark_leaf_tasks, check_samples_cover, load_benchmark_samples
 from evaluation.cli.checkpoint import load_checkpoint_config
 from evaluation.distributed_benchmarks import evaluate_configured_benchmarks
 from model.config import RecurrentConfig
@@ -36,6 +37,7 @@ class BenchmarkOptions:
     checkpoint: str | None = None
     output_dir: str | None = None
     tokenizer_dir: str | None = None
+    samples: str | None = None
 
 
 def parse_benchmark_settings(argv: list[str] | None = None) -> tuple[Settings, BenchmarkOptions]:
@@ -45,12 +47,17 @@ def parse_benchmark_settings(argv: list[str] | None = None) -> tuple[Settings, B
     parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint override; default: newest regular checkpoint")
     parser.add_argument("--output_dir", type=str, default=None, help="New result directory; default: unique benchmark_checks subdirectory")
     parser.add_argument("--tokenizer_dir", type=str, default=None, help="Relocated tokenizer; must match checkpoint identity")
+    parser.add_argument("--samples", type=str, default=None,
+                        help="JSON sample selection (for example a contamination check's clean_samples.json): only "
+                             "these examples per leaf task; every task of the run must be listed")
     namespace = parser.parse_args(argv)
     namespace.pop("config", None)
-    options = BenchmarkOptions(**{name: namespace.pop(name) for name in ("checkpoint", "output_dir", "tokenizer_dir")})
+    options = BenchmarkOptions(**{name: namespace.pop(name) for name in ("checkpoint", "output_dir", "tokenizer_dir", "samples")})
     settings = Settings(**parser.instantiate(namespace).as_dict())
     if not settings.benchmark_tasks:
         raise ValueError("benchmark_tasks must contain at least one task for an immediate benchmark check")
+    if options.samples is not None and settings.benchmark_limit is not None:
+        raise ValueError("--samples and --benchmark_limit cannot be combined")
     return settings, options
 
 
@@ -135,6 +142,12 @@ def run_benchmark_check_on_backend(
     checkpoint_name = backend.all_gather_object(selected)[0]
     assert checkpoint_name is not None
     checkpoint = Path(checkpoint_name)
+    # a sample selection must list every leaf task of the run; checked before the model loads, on rank zero
+    samples = None if options.samples is None else load_benchmark_samples(options.samples)
+    if samples is not None:
+        complete_main_phase(backend, "benchmark sample selection",
+                            lambda: check_samples_cover(samples, benchmark_leaf_tasks(settings.benchmark_tasks)))
+        log.info("sample selection %s: %d of its tasks listed", samples.source, len(samples.indices))
     log.info("loading benchmark checkpoint %s on %s", checkpoint, backend.device)
     model, tokenizer, step = load_benchmark_inputs(settings, options, checkpoint, backend.device)
     identity = (step, checkpoint.stat().st_size, checkpoint.stat().st_mtime_ns)
@@ -150,7 +163,7 @@ def run_benchmark_check_on_backend(
              step, backend.world_size, settings.benchmark_tasks, settings.benchmark_limit, output)
     result = evaluate_configured_benchmarks(
         backend, model, tokenizer, settings, out_path=output, step=step,
-        stop=StopController(backend, should_stop), on_fatal_error=on_fatal_error,
+        stop=StopController(backend, should_stop), on_fatal_error=on_fatal_error, samples=samples,
     )
     if backend.is_main:
         if result.completed:

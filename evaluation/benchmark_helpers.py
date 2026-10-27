@@ -1,13 +1,21 @@
 # (c) 2025-2026 Tobias Kerner. Apache-2.0.
-"""Validation, harness setup and result serialization for benchmark evaluation."""
+"""Validation, harness setup and result serialization for benchmark evaluation.
+
+A sample selection (`BenchmarkSamples`, read by `load_benchmark_samples`) restricts a run to listed examples per
+lm-eval leaf task, by position in the task's evaluation documents, the numbering `evaluation/contamination_check.py`
+writes its `clean_samples.json` in. Every leaf task of the run must be listed (`check_samples_cover`), so no task
+silently falls back to its full test set, and the result record names the file, its digest and the counts.
+"""
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import inspect
 import json
 import os
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -34,6 +42,71 @@ HARNESS_NUMPY_SEED = 1234
 HARNESS_FEWSHOT_SEED = 1234
 BOOTSTRAP_ITERS = 100  # lm-eval's stderr resampling; its default of 100000 is the slowest part of a small run
 CODE_EXECUTION_ENV = "HF_ALLOW_CODE_EVAL"  # "1" lets tasks that execute generated code run (humaneval, mbpp)
+
+
+@dataclass(frozen=True)
+class BenchmarkSamples:
+    """The examples to evaluate per lm-eval leaf task (positions in its evaluation documents), and their provenance."""
+
+    indices: dict[str, list[int]]
+    source: str
+    digest: str  # sha256 of the file's bytes
+    criterion: dict[str, Any]  # how the file was made, as written by its producer
+
+    def record(self) -> dict[str, Any]:
+        return {"source": self.source, "digest": self.digest, "criterion": self.criterion,
+                "counts": {task: len(indices) for task, indices in sorted(self.indices.items())}}
+
+
+def load_benchmark_samples(path: str | Path) -> BenchmarkSamples:
+    """
+    Read `{"samples": {leaf task: [doc index, ...]}, "criterion": {...}}`; every list non-empty, of distinct
+    non-negative integers (a task without examples left cannot be scored, and lm-eval would fail on it later).
+    """
+
+    raw = Path(path).read_bytes()
+    data = json.loads(raw)
+    if not isinstance(data, dict) or not isinstance(data.get("samples"), dict) or not data["samples"]:
+        raise ValueError(f"{path}: expected a JSON object with a non-empty 'samples' mapping")
+    indices: dict[str, list[int]] = {}
+    for task, values in data["samples"].items():
+        if (not isinstance(values, list) or not values
+                or any(type(value) is not int or value < 0 for value in values) or len(set(values)) != len(values)):
+            raise ValueError(f"{path}: samples of {task!r} must be a non-empty list of distinct non-negative integers")
+        indices[str(task)] = sorted(values)
+    criterion = data.get("criterion", {})
+    return BenchmarkSamples(indices, str(Path(path).resolve()), hashlib.sha256(raw).hexdigest(),
+                            criterion if isinstance(criterion, dict) else {"value": criterion})
+
+
+def benchmark_leaf_tasks(tasks: Sequence[str]) -> dict[str, int]:
+    """{leaf task name: evaluation documents} of the requested tasks, groups expanded the way lm-eval runs them."""
+
+    from lm_eval.tasks import TaskManager, get_task_dict
+
+    leaves: dict[str, int] = {}
+
+    def collect(mapping: Mapping[Any, Any]) -> None:
+        for key, value in mapping.items():
+            if isinstance(value, Mapping):
+                collect(value)
+            else:
+                leaves[str(key)] = len(value.eval_docs)
+
+    collect(get_task_dict(list(tasks), TaskManager()))
+    return leaves
+
+
+def check_samples_cover(samples: BenchmarkSamples, leaves: Mapping[str, int]) -> None:
+    """Every leaf task of the run is listed and every listed index exists; tasks of the file outside the run are fine."""
+
+    missing = sorted(set(leaves) - set(samples.indices))
+    if missing:
+        raise ValueError(f"sample selection {samples.source} does not list {missing}; they would run in full")
+    for task, count in leaves.items():
+        beyond = [index for index in samples.indices[task] if index >= count]
+        if beyond:
+            raise ValueError(f"sample selection lists {task} documents {beyond[:5]} but the task has {count}")
 
 
 def code_execution_allowed() -> bool:
@@ -84,7 +157,7 @@ def build_benchmark_harness(
 
 def run_benchmark_harness(
     lm_eval: Any, language_model: Any, tasks: Sequence[str], limit: int | None, num_fewshot: int,
-    apply_chat_template: bool = False,
+    apply_chat_template: bool = False, samples: BenchmarkSamples | None = None,
 ) -> dict[str, Any]:
     """Use the caller's post-construction Torch seed and preserve the harness's other seed defaults.
 
@@ -92,6 +165,8 @@ def run_benchmark_harness(
     argument checks, Python/NumPy seeds and logging consume no Torch randomness. None opts out of the harness's
     all-device Torch seeding, including its pending lazy CUDA side effects.
     """
+    if samples is not None and limit is not None:
+        raise ValueError("a sample selection and benchmark_limit cannot be combined")
     with use_serial_bootstrap():
         results: dict[str, Any] = lm_eval.simple_evaluate(  # per-sample logs would be retained in memory but never read
             model=language_model, tasks=list(tasks), limit=limit, log_samples=False,
@@ -100,6 +175,7 @@ def run_benchmark_harness(
             torch_random_seed=None, fewshot_random_seed=HARNESS_FEWSHOT_SEED, bootstrap_iters=BOOTSTRAP_ITERS,
             fewshot_as_multiturn=True, use_cache=None, cache_requests=False,
             confirm_run_unsafe_code=code_execution_allowed(),
+            **({"samples": {task: list(indices) for task, indices in samples.indices.items()}} if samples else {}),
             **({"apply_chat_template": True} if apply_chat_template else {}),
         )
     check_benchmark_results(results)
@@ -110,7 +186,7 @@ def save_benchmark_results(
     out_path: Path, *, step: int | None, tasks: Sequence[str], num_fewshot: int, limit: int | None, seed: int,
     recurrences: Sequence[Recurrence], metrics: dict[str, float], raw_results: dict[str, Any],
     versions: dict[str, Any], n_shot: dict[str, Any], execution_settings: dict[str, Any],
-    custom_kernels: bool, execution_policy: ExecutionPolicy | None,
+    custom_kernels: bool, execution_policy: ExecutionPolicy | None, samples: BenchmarkSamples | None = None,
 ) -> None:
     record: dict[str, Any] = {
         "step": step,
@@ -136,6 +212,8 @@ def save_benchmark_results(
     }
     if execution_policy is not None:
         record["execution_precision"] = execution_policy.precision
+    if samples is not None:
+        record["samples"] = samples.record()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open_atomic_output(out_path) as file:
         file.write(json.dumps(record, indent=2, default=str) + "\n")

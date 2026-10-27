@@ -8,8 +8,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from evaluation.benchmark_helpers import load_benchmark_samples
 from evaluation.contamination_check import (
-    build_examples, build_index, example_ngrams, markdown_report, plan_units, scan, summarize, trained_ranges,
+    build_examples, build_index, example_ngrams, load_lm_eval_docs, markdown_report, plan_units, sample_lists, scan,
+    summarize, trained_ranges, write_sample_lists,
 )
 
 QUESTION = ("which of the following best explains why the moon shows phases to an observer standing on the earth "
@@ -40,9 +42,9 @@ def setup(tmp_path: Path) -> dict[str, Any]:
     messages[2] = chat(" ".join(code_words[:14]))  # 2 of the solution's n-grams, under half
     write_shards(tmp_path / "web", "text", web, per_file=3)
     write_shards(tmp_path / "chat", "messages", messages, per_file=4)
-    docs = {
-        "qa": [{"question": QUESTION, "choices": {"text": ["a", "b"]}}, {"question": "too short to check"}],
-        "code": [{"prompt": SOLUTION, "entry_point": "add_numbers"}],
+    docs = {  # task -> leaf task -> docs; "qa" is a group of two leaves like mmlu
+        "qa": {"qa_one": [{"question": QUESTION, "choices": {"text": ["a", "b"]}}], "qa_two": [{"question": "too short to check"}]},
+        "code": {"code": [{"prompt": SOLUTION, "entry_point": "add_numbers"}]},
     }
     ranges = trained_ranges({"web": 2, "chat": 0}, {"web": 10, "chat": 4}, {"web": 6, "chat": 9, "unused": 0},
                             scope="trained")
@@ -74,7 +76,7 @@ def test_example_ngrams_use_fields_alone_then_joined() -> None:
 
 @pytest.mark.parametrize("workers", [1, 2])
 def test_scan_counts_trained_rows_only(setup: dict[str, Any], workers: int) -> None:
-    examples, unchecked = build_examples(setup["docs"])
+    examples, unchecked, _ = build_examples(setup["docs"])
     tasks = ["qa", "code"]
     units = plan_units(setup["directories"], setup["ranges"])
     results = scan(units, build_index(examples, tasks), workers)
@@ -90,4 +92,46 @@ def test_scan_counts_trained_rows_only(setup: dict[str, Any], workers: int) -> N
     assert (web["rows_scanned"], web["rows_with_hit"], web["rows_over_share"]) == (6, 1, {"qa": 1})
     assert (chat_source["rows_scanned"], chat_source["rows_with_hit"]) == (4, 1)
     text = markdown_report(report, {"step": 1})
-    assert "| qa | 2 | 1 | 1 (100.0%) | 1 (100.0%) | 1 (100.0%) | web 1 |" in text
+    assert "| qa | 2 | 1 | 1 (100.0%) | 1 (100.0%) | 1 (100.0%) | 1 (100.0%) | web 1 |" in text
+    assert qa["worst"][0]["leaf"] == "qa_one"
+
+
+def test_sample_lists_round_trip_into_benchmark_selection(setup: dict[str, Any], tmp_path: Path) -> None:
+    """
+    Flagged examples leave the clean list of their leaf task; a short unchecked example stays clean; the files load
+    as the selection `benchmark_checkpoint.py --samples` reads.
+    """
+
+    examples, _, sizes = build_examples(setup["docs"])
+    results = scan(plan_units(setup["directories"], setup["ranges"]), build_index(examples, ["qa", "code"]), 1)
+    clean, contaminated, shares = sample_lists(examples, sizes, results, flag_share=0.5)
+    assert contaminated == {"qa_one": [0]}  # the code example holds under half of its n-grams
+    assert clean == {"qa_two": [0], "code": [0]}  # qa_one has nothing clean left, so it has no clean entry
+    assert shares["qa_one"] == {0: 1.0} and 0 < shares["code"][0] < 0.5
+    assert sample_lists(examples, sizes, results, flag_share=0.2)[1] == {"qa_one": [0], "code": [0]}
+
+    write_sample_lists(tmp_path, clean, contaminated, shares, {"flag_share": 0.5})
+    selection = load_benchmark_samples(tmp_path / "clean_samples.json")
+    assert selection.indices == clean and selection.criterion == {"flag_share": 0.5, "selection": "clean"}
+    assert load_benchmark_samples(tmp_path / "contaminated_samples.json").indices == contaminated
+
+
+def test_tasks_that_cannot_load_are_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    import lm_eval.tasks
+
+    class Task:
+        def __init__(self, count: int) -> None:
+            self.eval_docs = [{"text": f"doc {index}"} for index in range(count)]
+
+    def get_task_dict(names: list[str], manager: Any) -> dict[str, Any]:
+        if names == ["gated"]:
+            raise PermissionError("dataset is gated")
+        return {"group": {"group_a": Task(2), "group_b": Task(1)}} if names == ["group"] else {names[0]: Task(3)}
+
+    monkeypatch.setattr(lm_eval.tasks, "TaskManager", lambda: None)
+    monkeypatch.setattr(lm_eval.tasks, "get_task_dict", get_task_dict)
+    docs, skipped = load_lm_eval_docs(["group", "gated", "plain"])
+    assert {task: {leaf: len(items) for leaf, items in leaves.items()} for task, leaves in docs.items()} == {
+        "group": {"group_a": 2, "group_b": 1}, "plain": {"plain": 3},
+    }
+    assert skipped == {"gated": "PermissionError: dataset is gated"}

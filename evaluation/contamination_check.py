@@ -7,7 +7,9 @@
 Benchmark side: the evaluation docs of every task as lm-eval scores them (test split, or validation where the task
 uses it). Each string field of a doc gives its normalized 13-grams (`get_ngram_set`, the normalization of the
 build's decontamination); a doc whose fields are all too short falls back to its fields joined, and a doc still
-shorter than 13 words is reported as unchecked. Group tasks (mmlu) report under the requested name.
+shorter than 13 words is reported as unchecked. Group tasks (mmlu) report under the requested name, while every
+example keeps its lm-eval leaf task and position (`mmlu_anatomy`, 12). A task that cannot be loaded (a gated
+dataset without access, a missing optional dependency) is skipped and named in the report.
 
 Training side: the checkpoint's own record of the data split and the rows its stream read (`validation_rows`,
 `source_rows`, `data_stream.consumed_rows`). Sources are read without shuffling from the first training row, so
@@ -20,6 +22,12 @@ Report (`contamination.md`, `contamination.json`): per task, how many examples s
 rows, at least half of their n-grams ("likely contaminated") and all of them, with the sources responsible; per
 source, the rows read and the rows sharing n-grams with a benchmark. Isolated 13-gram hits are mostly shared
 boilerplate (licence headers, common phrasings); the half-of-n-grams share is the meaningful figure.
+
+Sample lists for benchmark runs, per leaf task by position in its evaluation documents: `contaminated_samples.json`
+(examples with at least `--flag_share` of their n-grams in the training rows) and `clean_samples.json` (all
+others, unchecked short examples included), the format `benchmark_checkpoint.py --samples` reads; plus
+`example_shares.json` with the share of every example that has any hit, for other thresholds later. A leaf task
+whose examples are all flagged has no clean list and cannot be run clean.
 """
 
 from __future__ import annotations
@@ -49,9 +57,12 @@ DEFAULT_TASKS: tuple[str, ...] = (
     "arc_challenge", "hellaswag", "mmlu", "winogrande",  # the benchmarks of the training configs
     "piqa", "boolq", "race", "truthfulqa_mc2", "arc_easy", "openbookqa",  # the extra multiple-choice grid
     "gsm8k", "humaneval", "mbpp",  # the generation tasks
+    "leaderboard_mmlu_pro", "anli", "gpqa_main_zeroshot", "gpqa_diamond_zeroshot", "minerva_math500",  # the suite
+    "cb", "copa", "rte", "wic", "wsc", "sst2", "mrpc", "cola",
 )
 NGRAM = 13
 LIKELY_SHARE = 0.5  # an example with at least this share of its n-grams in the training rows counts as contaminated
+SAMPLES_FORMAT = "mbrt_benchmark_samples_v1"
 ROW_SHARE = 0.1  # a training row with more than this share of its n-grams in one task's docs (the build's threshold)
 WORST_EXAMPLES = 10  # per task in the JSON, for manual inspection
 PREVIEW_CHARS = 200
@@ -63,8 +74,9 @@ _KEYS: frozenset[str] = frozenset()  # its keys, for C-level set intersection wi
 
 @dataclass(frozen=True)
 class Example:
-    task: str
-    index: int  # position in the task's evaluation docs
+    task: str  # the requested task (mmlu)
+    leaf: str  # the lm-eval task that holds the doc (mmlu_anatomy), the key of a sample list
+    index: int  # position in the leaf task's evaluation docs
     ngrams: frozenset[str]
     preview: str
 
@@ -115,44 +127,56 @@ def example_ngrams(doc: Mapping[str, Any], n: int = NGRAM) -> frozenset[str]:
     return frozenset(ngrams or get_ngram_set(" ".join(strings), n))
 
 
-def load_lm_eval_docs(tasks: Sequence[str]) -> dict[str, list[dict[str, Any]]]:
-    """{task: evaluation docs} through lm-eval itself; the docs of a group's subtasks go under the group's name."""
+def load_lm_eval_docs(tasks: Sequence[str]) -> tuple[dict[str, dict[str, list[dict[str, Any]]]], dict[str, str]]:
+    """
+    ({task: {leaf task: evaluation docs}}, {task: why it could not be loaded}) through lm-eval itself, one task
+    at a time, so one that fails (gated, a missing dependency) is reported instead of stopping the check.
+    """
 
     from lm_eval.tasks import TaskManager, get_task_dict
 
-    def collect(value: Any) -> Iterator[dict[str, Any]]:
-        if isinstance(value, Mapping):
-            for item in value.values():
-                yield from collect(item)
-        else:
-            yield from (dict(doc) for doc in value.eval_docs)
+    def collect(mapping: Mapping[Any, Any], into: dict[str, list[dict[str, Any]]]) -> None:
+        for key, value in mapping.items():
+            if isinstance(value, Mapping):
+                collect(value, into)
+            else:
+                into[str(key)] = [dict(doc) for doc in value.eval_docs]
 
-    loaded = get_task_dict(list(tasks), TaskManager())
-    docs: dict[str, list[dict[str, Any]]] = {}
-    for key, value in loaded.items():
-        name = str(getattr(key, "group_name", key))
-        docs.setdefault(name, []).extend(collect(value))
-    missing = [task for task in tasks if task not in docs]
-    if missing:
-        raise KeyError(f"lm-eval returned no docs for {missing}; got {sorted(docs)}")
-    return {task: docs[task] for task in tasks}
+    manager = TaskManager()
+    docs: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    skipped: dict[str, str] = {}
+    for task in tasks:
+        try:
+            leaves: dict[str, list[dict[str, Any]]] = {}
+            collect(get_task_dict([task], manager), leaves)
+        except Exception as error:  # reported per task; the check continues with the others
+            skipped[task] = f"{type(error).__name__}: {error}"
+            log.warning("task %s skipped, it cannot be loaded: %s", task, skipped[task])
+            continue
+        docs[task] = leaves
+    return docs, skipped
 
 
-def build_examples(docs: Mapping[str, Sequence[Mapping[str, Any]]], n: int = NGRAM) -> tuple[list[Example], dict[str, int]]:
-    """The checkable examples of every task, and per task the number too short to have an n-gram."""
+def build_examples(
+    docs: Mapping[str, Mapping[str, Sequence[Mapping[str, Any]]]], n: int = NGRAM,
+) -> tuple[list[Example], dict[str, int], dict[str, int]]:
+    """The checkable examples, per task the number too short to have an n-gram, and per leaf task its doc count."""
 
     examples: list[Example] = []
     unchecked: dict[str, int] = {}
-    for task, task_docs in docs.items():
+    sizes: dict[str, int] = {}
+    for task, leaves in docs.items():
         unchecked[task] = 0
-        for index, doc in enumerate(task_docs):
-            ngrams = example_ngrams(doc, n)
-            if not ngrams:
-                unchecked[task] += 1
-                continue
-            preview = " ".join(" ".join(doc_strings(doc)).split())[:PREVIEW_CHARS]
-            examples.append(Example(task, index, ngrams, preview))
-    return examples, unchecked
+        for leaf, leaf_docs in leaves.items():
+            sizes[leaf] = len(leaf_docs)
+            for index, doc in enumerate(leaf_docs):
+                ngrams = example_ngrams(doc, n)
+                if not ngrams:
+                    unchecked[task] += 1
+                    continue
+                preview = " ".join(" ".join(doc_strings(doc)).split())[:PREVIEW_CHARS]
+                examples.append(Example(task, leaf, index, ngrams, preview))
+    return examples, unchecked, sizes
 
 
 def build_index(examples: Iterable[Example], tasks: Sequence[str]) -> dict[str, int]:
@@ -300,14 +324,58 @@ def scan(units: Sequence[Unit], index: dict[str, int], workers: int,
         gc.unfreeze()
 
 
+def hits_by_source(results: Iterable[UnitResult]) -> dict[str, set[str]]:
+    hits: dict[str, set[str]] = {}
+    for result in results:
+        hits.setdefault(result.source, set()).update(result.hits)
+    return hits
+
+
+def sample_lists(
+    examples: Iterable[Example], sizes: Mapping[str, int], results: Sequence[UnitResult], flag_share: float,
+) -> tuple[dict[str, list[int]], dict[str, list[int]], dict[str, dict[int, float]]]:
+    """
+    (clean, contaminated, shares) per leaf task: positions with at least `flag_share` of their n-grams in the
+    training rows are contaminated, every other position is clean (unchecked short ones included); shares hold
+    every example with any hit. A leaf task without clean or without contaminated positions has no entry there.
+    """
+
+    found = set().union(*hits_by_source(results).values()) if results else set()
+    flagged: dict[str, set[int]] = {}
+    shares: dict[str, dict[int, float]] = {}
+    for example in examples:
+        matched = len(example.ngrams & found)
+        if not matched:
+            continue
+        share = matched / len(example.ngrams)
+        shares.setdefault(example.leaf, {})[example.index] = round(share, 4)
+        if share >= flag_share:
+            flagged.setdefault(example.leaf, set()).add(example.index)
+    clean = {leaf: [index for index in range(count) if index not in flagged.get(leaf, set())] for leaf, count in sizes.items()}
+    contaminated = {leaf: sorted(indices) for leaf, indices in sorted(flagged.items())}
+    return {leaf: indices for leaf, indices in sorted(clean.items()) if indices}, contaminated, shares
+
+
+def write_sample_lists(
+    output: Path, clean: Mapping[str, list[int]], contaminated: Mapping[str, list[int]],
+    shares: Mapping[str, Mapping[int, float]], criterion: Mapping[str, Any],
+) -> None:
+    for name, samples in (("clean_samples.json", clean), ("contaminated_samples.json", contaminated)):
+        record = {"format": SAMPLES_FORMAT, "criterion": {**criterion, "selection": name.removesuffix("_samples.json")},
+                  "samples": dict(samples)}
+        (output / name).write_text(json.dumps(record, indent=1) + "\n", encoding="utf-8")
+    (output / "example_shares.json").write_text(json.dumps({"criterion": dict(criterion), "shares": {
+        leaf: {str(index): share for index, share in sorted(values.items())} for leaf, values in sorted(shares.items())
+    }}, indent=1) + "\n", encoding="utf-8")
+
+
 def summarize(
     examples: Sequence[Example], unchecked: Mapping[str, int], tasks: Sequence[str], results: Sequence[UnitResult],
-    ranges: Mapping[str, tuple[int, int]],
+    ranges: Mapping[str, tuple[int, int]], flag_share: float = LIKELY_SHARE,
 ) -> dict[str, Any]:
-    hits_by_source: dict[str, set[str]] = {}
+    by_source_hits = hits_by_source(results)
     sources: dict[str, dict[str, Any]] = {}
     for result in results:
-        hits_by_source.setdefault(result.source, set()).update(result.hits)
         entry = sources.setdefault(result.source, {
             "rows_scanned": 0, "million_chars": 0.0, "rows_with_hit": 0, "rows_over_share": {},
             "row_range": list(ranges[result.source]),
@@ -317,11 +385,11 @@ def summarize(
         entry["rows_with_hit"] += result.rows_with_hit
         for task, count in result.rows_over_share.items():
             entry["rows_over_share"][tasks[task]] = entry["rows_over_share"].get(tasks[task], 0) + count
-    all_hits = set().union(*hits_by_source.values()) if hits_by_source else set()
+    all_hits = set().union(*by_source_hits.values()) if by_source_hits else set()
 
     report_tasks: dict[str, dict[str, Any]] = {
         task: {"examples": unchecked.get(task, 0), "unchecked": unchecked.get(task, 0), "any_hit": 0, "likely": 0,
-               "complete": 0, "likely_by_source": {}, "worst": []}
+               "complete": 0, "flagged": 0, "likely_by_source": {}, "worst": []}
         for task in tasks
     }
     for example in examples:
@@ -334,19 +402,21 @@ def summarize(
         entry["any_hit"] += 1
         entry["likely"] += share >= LIKELY_SHARE
         entry["complete"] += share == 1.0
+        entry["flagged"] += share >= flag_share
         by_source = {source: len(example.ngrams & hits) / len(example.ngrams)
-                     for source, hits in hits_by_source.items() if example.ngrams & hits}
+                     for source, hits in by_source_hits.items() if example.ngrams & hits}
         for source, source_share in by_source.items():
             if source_share >= LIKELY_SHARE:
                 entry["likely_by_source"][source] = entry["likely_by_source"].get(source, 0) + 1
-        entry["worst"].append({"index": example.index, "share": round(share, 4), "ngrams": len(example.ngrams),
+        entry["worst"].append({"leaf": example.leaf, "index": example.index, "share": round(share, 4),
+                               "ngrams": len(example.ngrams),
                                "sources": {source: round(value, 4) for source, value in
                                            sorted(by_source.items(), key=lambda item: -item[1])},
                                "preview": example.preview})
     for entry in report_tasks.values():
         entry["worst"] = sorted(entry["worst"], key=lambda item: -item["share"])[:WORST_EXAMPLES]
-    return {"ngram": NGRAM, "likely_share": LIKELY_SHARE, "row_share": ROW_SHARE, "tasks": report_tasks,
-            "sources": sources}
+    return {"ngram": NGRAM, "likely_share": LIKELY_SHARE, "flag_share": flag_share, "row_share": ROW_SHARE,
+            "tasks": report_tasks, "sources": sources}
 
 
 def markdown_report(report: Mapping[str, Any], header: Mapping[str, Any]) -> str:
@@ -356,12 +426,14 @@ def markdown_report(report: Mapping[str, Any], header: Mapping[str, Any]) -> str
         "",
         f"Word {report['ngram']}-grams after lowercasing and whitespace normalization. \"Likely\": at least "
         f"{report['likely_share']:.0%} of an example's n-grams occur in the scanned training rows; \"complete\": all of "
-        "them. Isolated hits are mostly shared boilerplate; the likely share is the meaningful figure.",
+        "them. Isolated hits are mostly shared boilerplate; the likely share is the meaningful figure. \"Excluded\": "
+        f"examples with at least {report['flag_share']:.0%} of their n-grams found, listed in contaminated_samples.json "
+        "and left out of clean_samples.json (for `benchmark_checkpoint.py --samples`).",
         "",
         "## By task",
         "",
-        "| Task | Examples | Unchecked (too short) | Any hit | Likely | Complete | Likely, by source |",
-        "|---|---:|---:|---:|---:|---:|---|",
+        "| Task | Examples | Unchecked (too short) | Any hit | Likely | Complete | Excluded | Likely, by source |",
+        "|---|---:|---:|---:|---:|---:|---:|---|",
     ]
     for task, entry in report["tasks"].items():
         checked = entry["examples"] - entry["unchecked"]
@@ -372,7 +444,7 @@ def markdown_report(report: Mapping[str, Any], header: Mapping[str, Any]) -> str
         by_source = ", ".join(f"{source} {count}" for source, count in
                               sorted(entry["likely_by_source"].items(), key=lambda item: -item[1])) or "-"
         lines.append(f"| {task} | {entry['examples']} | {entry['unchecked']} | {share(entry['any_hit'])} | "
-                     f"{share(entry['likely'])} | {share(entry['complete'])} | {by_source} |")
+                     f"{share(entry['likely'])} | {share(entry['complete'])} | {share(entry['flagged'])} | {by_source} |")
     lines += [
         "",
         "## By source",
@@ -402,7 +474,12 @@ def parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--scope", choices=("trained", "all"), default="trained",
                         help="trained: the rows the checkpoint's stream read; all: every training row")
     parser.add_argument("--workers", type=int, default=1)
-    return parser.parse_args(argv)
+    parser.add_argument("--flag_share", type=float, default=LIKELY_SHARE,
+                        help="share of an example's n-grams found in training that excludes it from clean_samples.json")
+    arguments = parser.parse_args(argv)
+    if not 0.0 < arguments.flag_share <= 1.0:
+        parser.error("--flag_share must be in (0, 1]")
+    return arguments
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -441,8 +518,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     log.info("checkpoint %s (step %d): %d sources, %d shard units, scope %s", checkpoint, metadata.step,
              len(ranges), len(units), arguments.scope)
 
-    tasks = arguments.tasks.split(",")
-    examples, unchecked = build_examples(load_lm_eval_docs(tasks))
+    docs, skipped = load_lm_eval_docs(list(dict.fromkeys(arguments.tasks.split(","))))
+    tasks = list(docs)
+    examples, unchecked, sizes = build_examples(docs)
     index = build_index(examples, tasks)
     log.info("%d benchmark examples, %d distinct %d-grams", len(examples), len(index), NGRAM)
 
@@ -457,10 +535,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                      million_chars / max(now - started, 1e-9))
 
     results = scan(units, index, arguments.workers, progress)
-    report = summarize(examples, unchecked, tasks, results, ranges)
+    report = summarize(examples, unchecked, tasks, results, ranges, arguments.flag_share)
     header = {"run": settings.run_name, "checkpoint": str(checkpoint.resolve()), "step": metadata.step,
               "scope": arguments.scope, "dataset_config": settings.dataset_config,
               "scan_minutes": round((time.monotonic() - started) / 60, 1)}
+    clean, contaminated, shares = sample_lists(examples, sizes, results, arguments.flag_share)
+    no_clean = sorted(set(sizes) - set(clean))
+    if skipped:
+        header["skipped tasks (could not load)"] = "; ".join(f"{task} ({reason[:120]})" for task, reason in skipped.items())
+    if no_clean:
+        header["leaf tasks with no clean example (cannot run clean)"] = ", ".join(no_clean)
+    write_sample_lists(output, clean, contaminated, shares, {
+        "flag_share": arguments.flag_share, "ngram": NGRAM, "checkpoint": header["checkpoint"], "step": metadata.step,
+        "scope": arguments.scope, "dataset_config": settings.dataset_config,
+    })
     (output / "contamination.json").write_text(json.dumps({"header": header, **report}, indent=2) + "\n", encoding="utf-8")
     (output / "contamination.md").write_text(markdown_report(report, header), encoding="utf-8")
     log.info("report: %s", output / "contamination.md")
