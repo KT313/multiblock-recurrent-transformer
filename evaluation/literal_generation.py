@@ -2,11 +2,31 @@
 """HFLM generation with token EOS and only task-requested textual stops.
 
 Use the harness's collation, option normalization, forward and postprocessing APIs.
-The narrow difference from HFLM 0.4.13 is not treating decoded EOS as a text stop:
-a literal '</s>' encoded with ordinary tokens is valid generated content.
+Two narrow differences from HFLM 0.4.13: decoded EOS is not treated as a text stop (a literal '</s>' encoded
+with ordinary tokens is valid generated content), and a completion is decoded after its prompt
+(`decode_continuation`), so its leading whitespace survives SentencePiece decoding.
 """
 from copy import deepcopy
 from typing import Any
+
+
+def decode_continuation(lm: Any, prompt: list[int], continuation: list[int]) -> str:
+    """
+    The text of `continuation` as it reads after `prompt`.
+
+    SentencePiece tokenizers (the Llama family) drop the leading space of the first token of a decoded sequence, so
+    decoding a completion on its own turns a function body indented by four spaces into three and the code no longer
+    parses (HumanEval). Decoding it after the prompt and cutting off the prompt's text keeps every space. When the
+    prompt's text is not a prefix of the joint text (a character split across the boundary), the completion is
+    decoded on its own as before.
+    """
+
+    head: str = lm.tok_decode(prompt)
+    whole: str = lm.tok_decode(prompt + continuation)
+    if whole.startswith(head):
+        return whole[len(head):]
+    alone: str = lm.tok_decode(continuation)
+    return alone
 
 
 def generate_literal_until(lm: Any, requests: list[Any], disable_tqdm: bool = False) -> list[str]:
@@ -40,11 +60,12 @@ def generate_literal_until(lm: Any, requests: list[Any], disable_tqdm: bool = Fa
             generated = lm._model_generate(
                 context=ids.to(lm.device), attention_mask=mask.to(lm.device), stop=stops, max_length=cap, **kwargs,
             )
-            for tokens, context in zip(generated.tolist(), contexts, strict=True):
+            for tokens, context, keep in zip(generated.tolist(), contexts, mask.bool().tolist(), strict=True):
+                prompt = [token for token, kept in zip(tokens[:ids.shape[1]], keep, strict=True) if kept]  # no padding
                 suffix = tokens[ids.shape[1]:]
                 if lm.eot_token_id in suffix:
                     suffix = suffix[:suffix.index(lm.eot_token_id)]
-                text = postprocess_generated_text(lm.tok_decode(suffix), stop=stops, think_end_token=None)
+                text = postprocess_generated_text(decode_continuation(lm, prompt, suffix), stop=stops, think_end_token=None)
                 responses.append(text)
                 lm.cache_hook.add_partial("generate_until", (context, options[0]), text)
                 progress.update(1)

@@ -89,6 +89,49 @@ def test_chat_scoring_boundary_and_literal_generation(profile_path: Path, monkey
         assert lm.generate_until([request], disable_tqdm=True) == ["kept </s> tail"]
 
 
+def test_completion_keeps_leading_space_dropped_by_lone_decoding() -> None:
+    """
+    A SentencePiece-style decoder drops the first token's leading space; the completion is read after its prompt.
+    """
+
+    from evaluation.literal_generation import decode_continuation
+
+    pieces = {1: "def f():", 2: "\n", 3: "▁▁▁", 4: "▁return", 5: "▁1"}
+
+    class Decoder:
+        def tok_decode(self, tokens: list[int]) -> str:
+            return "".join(pieces[token] for token in tokens).replace("▁", " ").removeprefix(" ")
+
+    assert Decoder().tok_decode([3, 4, 5]) == "   return 1"  # alone: three spaces, an IndentationError
+    assert decode_continuation(Decoder(), [1, 2], [3, 4, 5]) == "    return 1"
+
+
+def test_real_generation_keeps_function_body_indentation(profile_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    HumanEval's case with the real tokenizer: a body indented by four spaces comes back with all four.
+    """
+
+    from lm_eval.models import huggingface
+    from lm_eval.api.instance import Instance
+    from model import build_model
+    from model.test_config import TINY_ARCHITECTURE
+    tokenizer = Tokenizer(profile_path)
+    model = build_model(TINY_ARCHITECTURE, vocab_size=32002, padded_vocab_size=32768, use_custom_kernels=False, init_orthogonal=False)
+    prompt, completion = 'def add(a, b):\n    """Return the sum."""\n', "    return a + b\n"
+    with inference_session(model) as session:
+        _, lm = build_benchmark_harness(session, tokenizer, huggingface, 2, 64, False)
+        context = lm.tok_encode(prompt)
+        suffix = lm.tok_encode(prompt + completion)[len(context):]
+        assert lm.tok_decode(suffix) != completion  # decoded alone, the indentation loses a space
+
+        def generate(context: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+            return torch.cat([context, torch.tensor([suffix] * len(context))], dim=1)
+
+        monkeypatch.setattr(lm, "_model_generate", generate)
+        request = Instance(request_type="generate_until", doc={}, arguments=(prompt, {"max_gen_toks": 16, "until": []}), idx=0)
+        assert lm.generate_until([request], disable_tqdm=True) == [completion]
+
+
 def test_atomic_output_keeps_previous_file_on_error(tmp_path: Path) -> None:
     from evaluation.publication import open_atomic_output
     path = tmp_path / "scores.json"
