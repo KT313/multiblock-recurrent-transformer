@@ -288,3 +288,22 @@ def test_generation_accepts_no_grad_model_construction() -> None:
         ids, mask = batch()
         output = model(ids, attention_mask=mask, generation_state=GenerationState(seed=1), use_cache=True, return_logits=True)
     assert output["logits"] is not None
+
+
+def test_trainable_initial_state_generation_ignores_the_session_noise() -> None:
+    model = generation_model(use_trainable_initial_state=True)
+    ids, mask = batch()
+    sessions = [GenerationState(seed=1), GenerationState(seed=2)]
+    with torch.inference_mode():
+        whole = [model(ids, attention_mask=mask, generation_state=session, return_logits=True)["logits"] for session in sessions]
+        pieces = GenerationState(seed=3)
+        outputs = [
+            model(ids[:, i:i + 1], attention_mask=mask[:, :i + 1], generation_state=pieces, use_cache=True, return_logits=True)["logits"]
+            for i in range(ids.shape[1])
+        ]
+        plain = model(ids, attention_mask=mask, return_logits=True)["logits"]
+    assert whole[0] is not None and whole[1] is not None and plain is not None
+    assert torch.equal(whole[0], whole[1]) and not sessions[0].latents and not pieces.latents
+    torch.testing.assert_close(torch.cat([o for o in outputs if o is not None], dim=1), whole[0], atol=3e-5, rtol=2e-5)
+    # left padding: compare the real tokens of the unpadded row with the plain (uncached, no session) forward
+    torch.testing.assert_close(plain[1], whole[0][1], atol=3e-5, rtol=2e-5)

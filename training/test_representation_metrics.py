@@ -319,3 +319,21 @@ def test_all_adapter_iterations_match_actual_tensors_and_exclude_perturbations(m
     finally:
         for handle in handles:
             handle.remove()
+
+
+def test_probe_starts_from_the_trainable_initial_state(tiny_model: RecurrentGPT) -> None:
+    model = RecurrentGPT(replace(tiny_model.config, use_trainable_initial_state=True)).eval()
+    batch = make_pack()
+    observed: list[torch.Tensor] = []
+    handle = model.transformer.ln_final.register_forward_hook(lambda module, inputs, output: observed.append(output.detach().clone()))
+    probe = track_recurrence_metrics(model, SingleDeviceBackend('cpu', '32'), batch, correlations='adapter')
+    tokens = select_probe_document(batch, model.config.model_max_sequence_length)
+    assert tokens is not None
+    try:
+        with torch.no_grad():
+            model(tokens, num_steps=(2, 0))
+    finally:
+        handle.remove()
+    expected = representation_metrics(observed[-1][0])
+    for metric in ('correlation', 'dispersion', 'rms'):
+        torch.testing.assert_close(probe[f'representation/pre_head/{metric}'], expected[metric], rtol=0, atol=0)

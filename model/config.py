@@ -114,6 +114,10 @@ class RecurrentConfig:
     n_layers_in_coda: int = 2
     n_layers_in_recurrent_block: int | list[int] = 4
     state_init: Literal["normal"] = "normal"
+    # True: each core block starts its recurrence from a learned (n_embd,) vector (initialised N(0, 1), the same
+    # distribution as the noise), expanded over batch and positions, instead of fresh `state_init` noise per forward.
+    # It enters only the first iteration, so it gets gradient only when a block runs no no-grad iterations.
+    use_trainable_initial_state: bool = False
     sampling_scheme: Literal["poisson-lognormal-filling"] = "poisson-lognormal-filling"
     mean_recurrence: int | list[int] = 12
     # A cap, not a mean, despite the inherited name (kept: it is in the shipped YAMLs and in every checkpoint's
@@ -122,7 +126,7 @@ class RecurrentConfig:
     mean_backprop_depth: int | list[int] = 8
 
     def __post_init__(self) -> None:
-        for name in ("tie_embeddings", "qk_bias", "use_custom_kernels", "init_orthogonal"):
+        for name in ("tie_embeddings", "qk_bias", "use_custom_kernels", "init_orthogonal", "use_trainable_initial_state"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be a boolean")
         # Nested settings arrive as plain dicts from YAML / JSON.

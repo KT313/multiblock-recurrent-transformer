@@ -16,9 +16,12 @@ import os
 import sys
 from pathlib import Path
 
+# drop this folder from the import path: this file would shadow the `evaluate` package that lm-eval's code tasks
+# (humaneval, mbpp) import
+sys.path[:] = [entry for entry in sys.path if Path(entry or ".").resolve() != Path(__file__).resolve().parent]
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # allow `python evaluation/evaluate.py` from the repo root
 
-from evaluation.cli import (
+from evaluation.cli import (  # noqa: E402
     load_checkpoint_evaluation,
     load_checkpoint_model,
     parse_arguments,

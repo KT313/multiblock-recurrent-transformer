@@ -65,6 +65,7 @@ _MODEL_FIELDS = (
     "n_layers_in_coda",
     "n_layers_in_recurrent_block",
     "state_init",
+    "use_trainable_initial_state",
     "sampling_scheme",
     "mean_recurrence",
     "mean_backprop_depth",

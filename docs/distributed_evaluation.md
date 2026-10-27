@@ -53,6 +53,8 @@ The command loads model weights on each rank but creates no optimizer, data load
 
 Results use the normal benchmark JSON schema and are saved in a fresh `<out_dir>/<run_name>/benchmark_checks/step-XXXXXXXX-*/step-XXXXXXXX.json`. Existing scheduled results and training logs are preserved. `--output_dir` chooses a new directory, which must not already exist. Ctrl-C/SIGTERM requests a stop at the next shared benchmark boundary; incomplete work publishes no results. Fatal failures under torchrun use the same worker-exit policy as training. This verifies checkpoint inference, not resuming an optimizer or a complete training step. Benchmark datasets still need network access or an existing local cache.
 
+Tasks that execute generated code (`humaneval`, `mbpp`) run only with `HF_ALLOW_CODE_EVAL=1` in the environment. lm-eval's `code_eval` metric requires the same variable, and the harness then passes `confirm_run_unsafe_code=True`. The code runs on the evaluating node under the metric's timeouts. The result metadata records the setting as `confirm_run_unsafe_code`.
+
 ## Testing
 
 CPU tests are offline and should run serially:

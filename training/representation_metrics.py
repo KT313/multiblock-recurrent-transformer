@@ -254,7 +254,10 @@ def track_recurrence_metrics(
             e = modules.ln_fs[index](x)
             adapter = modules.adapters[index]
             base = adapter_base_projection(e, adapter)
-            s = torch.randn(x.shape, device=device, dtype=x.dtype, generator=generator)
+            if model.config.use_trainable_initial_state:  # the learned state is what the recurrence starts from
+                s = model.initial_latent(index, x)
+            else:
+                s = torch.randn(x.shape, device=device, dtype=x.dtype, generator=generator)
             if model.core_bf16_stream and torch.is_autocast_enabled(device.type):
                 s = s.to(torch.get_autocast_dtype(device.type))
             depth = min(means[index], MAX_PROBE_DEPTH)

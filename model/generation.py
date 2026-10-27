@@ -3,7 +3,8 @@
 
 No state is registered on the model or serialized in a checkpoint. A session belongs to one model revision,
 batch, precision and fixed recurrence schedule. Its private normal generators assign noise one token at a time,
-so prefill and incremental execution use the same noise regardless of how the prefix is chunked.
+so prefill and incremental execution use the same noise regardless of how the prefix is chunked. A model with
+`use_trainable_initial_state` draws no latents here: every token starts from the model's learned state.
 """
 
 from __future__ import annotations

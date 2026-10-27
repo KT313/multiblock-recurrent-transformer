@@ -225,8 +225,11 @@ def check_settings_unchanged(
     stored_settings = {
         "use_custom_kernels": False, "loss_normalization": "legacy_pack_v0", "optimizer_sharding": "none"
     } | metadata.settings
-    # Pre-scaling checkpoints used unit-gain sandwich branches; only that default is implicit on resume.
-    stored_model_config = {"use_custom_kernels": False, "residual_scaling": "none"} | metadata.model_config
+    # Pre-scaling checkpoints used unit-gain sandwich branches, older ones the noise initial state; only those
+    # defaults are implicit on resume.
+    stored_model_config = {
+        "use_custom_kernels": False, "residual_scaling": "none", "use_trainable_initial_state": False
+    } | metadata.model_config
     compared = [key for key in current if key not in SETTINGS_ALLOWED_TO_DIFFER_ON_RESUME]
     details = {
         key: f"checkpoint {stored_settings[key]!r} != current {current[key]!r}"

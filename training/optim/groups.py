@@ -17,7 +17,8 @@ def get_param_groups(
     Split parameters into weights / embeddings / scale-and-norm groups, as upstream did.
 
     Group order matters for checkpoints: 0 = matrices, 1 = embeddings (+ tied lm_head, `EMBEDDING_GROUP`),
-    2 = norms and biases.
+    2 = norms, biases and the trainable initial states (`use_trainable_initial_state`; no weight decay pulling
+    them toward zero under `no_wd_for_bias_and_norm`).
     """
 
     weights_group: list[Tensor] = []
@@ -27,7 +28,7 @@ def get_param_groups(
         name_lower = name.lower()
         if "wte" in name_lower or "embedding" in name_lower or "lm_head" in name_lower:
             embedding_group.append(param)
-        elif "ln_f" in name_lower or "norm" in name_lower or "bias" in name_lower:
+        elif "ln_f" in name_lower or "norm" in name_lower or "bias" in name_lower or "initial_state" in name_lower:
             scale_and_norm_group.append(param)
         elif "proj" in name_lower or "qkv" in name_lower or "fc" in name_lower or param.ndim == 2:
             weights_group.append(param)

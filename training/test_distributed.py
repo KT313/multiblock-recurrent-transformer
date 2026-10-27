@@ -202,6 +202,26 @@ def test_rank_one_says_nothing_below_warning(base_run: Launch) -> None:
     assert not any("[rank 1]" in line and " INFO " in line for line in lines)
 
 
+def test_two_ranks_train_a_trainable_initial_state(tmp_path: Path, tiny_dataset_dir: Path) -> None:
+    """
+    The learned initial state gets no gradient on the steps whose sampled depth starts with no-grad iterations
+    (tiny: mean recurrence 2, backprop cap 2, so about a quarter of the draws); plain DDP would fail on the step
+    after the first of them. The run finishes and the state moved away from its initialisation.
+    """
+
+    yaml_path, run_directory = two_rank_yaml(
+        tmp_path / "learned", tiny_dataset_dir, model_overwrite={"use_trainable_initial_state": True}
+    )
+    result = launch(yaml_path, run_directory)
+    assert result.returncode == 0, result.stderr[-4000:]
+    model = result.final_checkpoint()["model"]
+    assert isinstance(model, dict)
+    first = torch.load(checkpoint_dir(run_directory) / "step-00000010-tiny.pth", map_location="cpu", weights_only=False)["model"]
+    for block in range(2):
+        name = f"transformer.initial_states.{block}"
+        assert not torch.equal(model[name], first[name]), name
+
+
 def _assert_same_model_and_optimizer(expected: dict[str, object], actual: dict[str, object]) -> None:
     expected_model, actual_model = expected["model"], actual["model"]
     assert isinstance(expected_model, dict) and isinstance(actual_model, dict)

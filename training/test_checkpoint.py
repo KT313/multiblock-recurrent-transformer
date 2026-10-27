@@ -606,6 +606,18 @@ def test_legacy_checkpoint_residual_scaling_defaults_to_none(
     assert 'residual_scaling' not in metadata.model_config  # preserve historical metadata
 
 
+def test_legacy_checkpoint_without_trainable_initial_state_resumes_with_the_noise(
+    backend: SingleDeviceBackend, tiny_model: RecurrentGPT,
+) -> None:
+    metadata = _metadata(backend, tiny_model)
+    metadata.model_config.pop('use_trainable_initial_state')
+    settings = _settings(run_name='tiny', seed=42)
+    config = tiny_model.config.to_dict()
+    check_settings_unchanged(metadata, settings, config, False)
+    with pytest.raises(ValueError, match='use_trainable_initial_state'):
+        check_settings_unchanged(metadata, settings, config | {'use_trainable_initial_state': True}, False)
+
+
 def test_legacy_objective_requires_acknowledgement(backend: SingleDeviceBackend, tiny_model: RecurrentGPT,
                                                   caplog: pytest.LogCaptureFixture) -> None:
     settings = _settings(run_name="tiny", seed=42)
