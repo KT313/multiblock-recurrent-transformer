@@ -127,7 +127,8 @@ def dataloader_over(
     yields a `WorkerBatch` of unpadded samples that `BatchStream` packs later, so `padding_multiple` and
     `ignore_index` do not apply to it. pin_memory is the backend's decision. generator is the source of the
     per-iterator base seed; without one, every `iter()` draws it from the global torch RNG. Workers keep
-    `TRAIN_LOADER_PREFETCH_FACTOR` batches ready.
+    `TRAIN_LOADER_PREFETCH_FACTOR` batches ready. Workers use spawn so their OS parent is the training process:
+    torch's parent-death watchdog cannot detect a dead training process when the parent is a forkserver.
     """
 
     if batch_size <= 0:
@@ -150,6 +151,7 @@ def dataloader_over(
         pin_memory=pin_memory,
         collate_fn=collate,
         num_workers=num_workers,
+        multiprocessing_context="spawn" if num_workers > 0 else None,
         prefetch_factor=TRAIN_LOADER_PREFETCH_FACTOR if num_workers > 0 else None,
         generator=generator,
         worker_init_fn=worker_init_fn,

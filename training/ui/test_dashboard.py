@@ -228,7 +228,9 @@ def test_live_dashboard_writes_the_fallback_lines_to_the_log_file_only(tmp_path:
 
 
 def test_live_and_fallback_dashboards_write_identical_log_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(time, "time", lambda: 1_756_000_000.0)  # `logging` stamps records with `time.time`: one asctime in both
+    # Freeze both clock APIs: the logging implementation depends on the Python version.
+    monkeypatch.setattr(time, "time", lambda: 1_756_000_000.0)
+    monkeypatch.setattr(time, "time_ns", lambda: 1_756_000_000_000_000_000)
     logger = logging.getLogger("training")
     files: dict[str, bytes] = {}
     for name in ("live", "fallback"):
